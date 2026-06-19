@@ -383,6 +383,10 @@ def normalize_circle_parts_name(parts_name):
 
 
 def resolve_circle_profile_from_name(parts_name):
+    direct_match = CIRCLE_PROFILE_BY_NAME.get(parts_name)
+    if direct_match is not None:
+        return direct_match
+
     normalized = normalize_circle_parts_name(parts_name)
     if not normalized:
         return None
