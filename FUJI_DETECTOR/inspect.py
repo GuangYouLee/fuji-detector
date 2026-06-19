@@ -2,6 +2,7 @@ import base64
 import io
 import random
 from collections import Counter
+from difflib import SequenceMatcher
 from functools import lru_cache
 import numpy as np
 import cv2
@@ -37,6 +38,10 @@ CIRCLE_PROFILE_BY_NAME = {
     "t0.2*9.0": ("t0.2*9.0", [(65, 90)], 75, "medium"),
     "t0.2*9": ("t0.2*9.0", [(65, 90)], 75, "medium"),
 }
+ALL_KNOWN_PART_NAMES = KNOWN_CYLINDER_PART_NAME_SUFFIXES + tuple(dict.fromkeys(
+    list(CIRCLE_PROFILE_BY_NAME.keys()) +
+    [key[:-2] for key in CIRCLE_PROFILE_BY_NAME if key.endswith(".0")]
+))
 
 def fit_circle_algebraic(x, y):
     """Fits a circle to points (x, y) using algebraic least squares."""
@@ -183,9 +188,14 @@ def _foreground_bbox(mask):
 
 
 def _generate_text_masks(gray):
+    """Normalizes a grayscale row-cell text region with local contrast and
+    produces several binarized masks from both dark-on-light and light-on-dark
+    assumptions. Masks are lightly cleaned (borders trimmed, small horizontal
+    morphology to reconnect broken strokes) before deduplication."""
     gray = gray.astype(np.uint8)
     background_level = float(np.median(gray))
     masks = []
+    close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 1))
 
     def add_mask(mask):
         mask = mask.astype(np.uint8)
@@ -193,6 +203,9 @@ def _generate_text_masks(gray):
         mask[-2:, :] = 0
         mask[:, :2] = 0
         mask[:, -2:] = 0
+        # Light morphology to reconnect broken strokes without merging
+        # adjacent characters (horizontal-only close).
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_kernel)
         foreground = int(np.count_nonzero(mask))
         if foreground < 8 or foreground > int(mask.size * 0.65):
             return
@@ -214,14 +227,38 @@ def _generate_text_masks(gray):
     _, thresh_light = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
     add_mask(thresh_light)
 
+    # Local-contrast (CLAHE) normalized masks for anti-aliased or faint text
+    # on uneven row backgrounds (e.g. selected gray rows).
+    h_img, w_img = gray.shape[:2]
+    tile_h = max(2, (h_img + 7) // 8)
+    tile_w = max(2, (w_img + 7) // 8)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(tile_h, tile_w))
+    equalized = clahe.apply(gray)
+    eq_background = float(np.median(equalized))
+    for offset in (8, 16, 24):
+        dark_eq = np.zeros_like(gray, dtype=np.uint8)
+        dark_eq[equalized <= max(25, min(220, int(eq_background - offset)))] = 255
+        add_mask(dark_eq)
+
+        light_eq = np.zeros_like(gray, dtype=np.uint8)
+        light_eq[equalized >= min(245, max(35, int(eq_background + offset)))] = 255
+        add_mask(light_eq)
+
+    _, eq_thresh_dark = cv2.threshold(equalized, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
+    add_mask(eq_thresh_dark)
+    _, eq_thresh_light = cv2.threshold(equalized, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+    add_mask(eq_thresh_light)
+
     return masks
 
 
-def _match_known_text(gray, candidates, max_width_delta=6, max_height_delta=4, max_score=0.60):
+def _rank_text_candidates(gray, candidates, max_width_delta, max_height_delta):
+    """Scores every candidate against every generated text mask and returns
+    (best_name, best_score, second_score) where the margin is measured between
+    the best and second-best *different* candidate (not the same candidate from
+    a different mask)."""
     candidates = tuple(candidates)
-    best_name = None
-    best_score = float("inf")
-    second_best_score = float("inf")
+    best_per_candidate = {}
 
     for text_mask in _generate_text_masks(gray):
         actual_bbox = _foreground_bbox(text_mask)
@@ -261,86 +298,36 @@ def _match_known_text(gray, candidates, max_width_delta=6, max_height_delta=4, m
             density_penalty = abs(density_actual - density_template)
             score = diff + (0.90 * width_penalty) + (0.25 * height_penalty) + (0.35 * density_penalty)
 
-            if score < best_score:
-                second_best_score = best_score
-                best_score = score
-                best_name = candidate
-            elif score < second_best_score:
-                second_best_score = score
+            prev = best_per_candidate.get(candidate)
+            if prev is None or score < prev:
+                best_per_candidate[candidate] = score
+
+    if not best_per_candidate:
+        return None, float("inf"), float("inf")
+
+    ranked = sorted(best_per_candidate.items(), key=lambda item: item[1])
+    best_name, best_score = ranked[0]
+    second_score = ranked[1][1] if len(ranked) > 1 else float("inf")
+    return best_name, best_score, second_score
+
+
+def _match_known_text(gray, candidates, max_width_delta=6, max_height_delta=4, max_score=0.60):
+    candidates = tuple(candidates)
+    best_name, best_score, second_score = _rank_text_candidates(
+        gray, candidates, max_width_delta, max_height_delta
+    )
 
     if (
         best_name is not None and
         best_score <= max_score and
         (
             len(candidates) == 1 or
-            second_best_score == float("inf") or
-            (second_best_score - best_score) >= 0.01
+            second_score == float("inf") or
+            (second_score - best_score) >= 0.01
         )
     ):
         return best_name
     return None
-
-
-def _match_known_parts_name(name_crop, candidates):
-    gray = cv2.cvtColor(name_crop, cv2.COLOR_RGB2GRAY)
-    best_name = None
-    best_score = float("inf")
-    second_best_score = float("inf")
-
-    for text_mask in _generate_text_masks(gray):
-        actual_bbox = _foreground_bbox(text_mask)
-        if actual_bbox is None:
-            continue
-
-        ax0, ay0, ax1, ay1 = actual_bbox
-        actual_crop = text_mask[ay0:ay1, ax0:ax1]
-        actual_h, actual_w = actual_crop.shape[:2]
-        if actual_w < 8 or actual_h < 6:
-            continue
-
-        for candidate in candidates:
-            template_mask = _render_parts_name_mask(candidate, (max(actual_w + 12, 64), max(actual_h + 12, 24)), 4, 4)
-            template_bbox = _foreground_bbox(template_mask)
-            if template_bbox is None:
-                continue
-
-            tx0, ty0, tx1, ty1 = template_bbox
-            template_crop = template_mask[ty0:ty1, tx0:tx1]
-            template_h, template_w = template_crop.shape[:2]
-            if abs(template_w - actual_w) > 6 or abs(template_h - actual_h) > 4:
-                continue
-
-            compare_w = max(template_w, actual_w)
-            compare_h = max(template_h, actual_h)
-            actual_canvas = np.zeros((compare_h, compare_w), dtype=np.uint8)
-            template_canvas = np.zeros((compare_h, compare_w), dtype=np.uint8)
-            actual_canvas[:actual_h, :actual_w] = actual_crop
-            template_canvas[:template_h, :template_w] = template_crop
-
-            diff = float(np.mean(cv2.absdiff(actual_canvas, template_canvas))) / 255.0
-            width_penalty = abs(template_w - actual_w) / float(max(template_w, actual_w, 1))
-            height_penalty = abs(template_h - actual_h) / float(max(template_h, actual_h, 1))
-            density_actual = float(np.count_nonzero(actual_canvas)) / float(actual_canvas.size)
-            density_template = float(np.count_nonzero(template_canvas)) / float(template_canvas.size)
-            density_penalty = abs(density_actual - density_template)
-            score = diff + (0.90 * width_penalty) + (0.25 * height_penalty) + (0.35 * density_penalty)
-
-            if score < best_score:
-                second_best_score = best_score
-                best_score = score
-                best_name = candidate
-            elif score < second_best_score:
-                second_best_score = score
-
-    if (
-        best_name is not None and
-        best_score <= 0.60 and
-        (second_best_score == float("inf") or (second_best_score - best_score) >= 0.01)
-    ):
-        return best_name
-    return None
-
-
 def _sanitize_parts_name(text):
     if not text:
         return None
@@ -350,8 +337,6 @@ def _sanitize_parts_name(text):
     if not any(ch.isalpha() for ch in cleaned):
         return None
     return cleaned
-
-
 def normalize_circle_parts_name(parts_name):
     if not parts_name:
         return None
@@ -576,31 +561,16 @@ def _extract_text_boxes(thresh, min_width=2, max_width=22, min_height=6, max_hei
         boxes.append((x, y, w_c, h_c))
     boxes.sort(key=lambda box: box[0])
     return boxes
-
-
 def _ocr_parts_name_from_crop(name_crop):
     gray = cv2.cvtColor(name_crop, cv2.COLOR_RGB2GRAY)
     gray = cv2.GaussianBlur(gray, (3, 3), 0)
     candidates = []
-    background_level = float(np.median(gray))
-    threshold_values = [
-        int(max(25, min(220, background_level - 8))),
-        int(max(35, min(220, background_level - 18))),
-        int(max(35, min(220, background_level - 28))),
-    ]
 
-    for threshold_value in threshold_values:
-        thresh = np.zeros_like(gray, dtype=np.uint8)
-        thresh[gray <= threshold_value] = 255
-        thresh[:2, :] = 0
-        thresh[-2:, :] = 0
-        thresh[:, :2] = 0
-        thresh[:, -2:] = 0
-
+    for text_mask in _generate_text_masks(gray):
         char_box_sets = []
 
         contour_boxes = _extract_text_boxes(
-            thresh,
+            text_mask,
             min_width=1,
             max_width=20,
             min_height=4,
@@ -610,7 +580,10 @@ def _ocr_parts_name_from_crop(name_crop):
         if contour_boxes:
             char_box_sets.append(contour_boxes)
 
-        col_foreground = np.count_nonzero(thresh > 0, axis=0)
+        # Column projection merges obviously split character components that
+        # contours separated into multiple boxes (e.g. broken strokes after
+        # thresholding).
+        col_foreground = np.count_nonzero(text_mask > 0, axis=0)
         projection_boxes = []
         start = None
         for idx, count in enumerate(col_foreground):
@@ -619,7 +592,7 @@ def _ocr_parts_name_from_crop(name_crop):
             elif count == 0 and start is not None:
                 end = idx
                 if end - start >= 1:
-                    char_slice = thresh[:, start:end]
+                    char_slice = text_mask[:, start:end]
                     row_foreground = np.count_nonzero(char_slice > 0, axis=1)
                     ys = np.where(row_foreground >= 1)[0]
                     if len(ys) > 0:
@@ -630,7 +603,7 @@ def _ocr_parts_name_from_crop(name_crop):
         if start is not None:
             end = len(col_foreground)
             if end - start >= 1:
-                char_slice = thresh[:, start:end]
+                char_slice = text_mask[:, start:end]
                 row_foreground = np.count_nonzero(char_slice > 0, axis=1)
                 ys = np.where(row_foreground >= 1)[0]
                 if len(ys) > 0:
@@ -646,7 +619,7 @@ def _ocr_parts_name_from_crop(name_crop):
             for x, y, w_c, h_c in char_boxes:
                 if not (1 <= w_c <= 20 and 4 <= h_c <= 18):
                     continue
-                char_img = thresh[y:y + h_c, x:x + w_c]
+                char_img = text_mask[y:y + h_c, x:x + w_c]
                 char, score = _match_parts_name_char(char_img)
                 if char is not None and score <= 0.72:
                     chars.append(char)
@@ -723,10 +696,45 @@ def ocr_parts_name(arr, active_row):
             return None
 
         name_crop = arr[active_y_start:active_y_end, TABLE_PARTS_NAME_COL_SLICE]
-        matched_name = _match_known_parts_name(name_crop, KNOWN_CYLINDER_PART_NAME_SUFFIXES)
-        if matched_name is not None:
-            return matched_name
-        return _sanitize_parts_name(_ocr_parts_name_from_crop(name_crop))
+        # Prefer high-confidence whole-name matches (cylinder suffixes first,
+        # then known circle names) before falling back to per-character OCR.
+        gray = cv2.cvtColor(name_crop, cv2.COLOR_RGB2GRAY)
+        best_name, best_score, second_score = _rank_text_candidates(gray, ALL_KNOWN_PART_NAMES, 6, 4)
+        if (
+            best_name is not None and
+            best_score <= 0.60 and
+            (second_score == float("inf") or (second_score - best_score) >= 0.01)
+        ):
+            if best_name in KNOWN_CYLINDER_PART_NAME_SUFFIXES:
+                return best_name
+            normalized = normalize_circle_parts_name(best_name)
+            if normalized is not None and normalized in CIRCLE_PROFILE_BY_NAME:
+                return normalized
+            return best_name
+        raw_name = _sanitize_parts_name(_ocr_parts_name_from_crop(name_crop))
+        if raw_name is not None:
+            normalized_raw_name = "".join(ch for ch in raw_name.upper() if ch.isalnum())
+            if len(normalized_raw_name) >= 6:
+                best_ratio, second_ratio = 0.0, 0.0
+                best_cylinder_name = None
+                for candidate in KNOWN_CYLINDER_PART_NAME_SUFFIXES:
+                    ratio = SequenceMatcher(
+                        None,
+                        normalized_raw_name,
+                        "".join(ch for ch in candidate.upper() if ch.isalnum()),
+                    ).ratio()
+                    if ratio > best_ratio:
+                        second_ratio = best_ratio
+                        best_ratio = ratio
+                        best_cylinder_name = candidate
+                    elif ratio > second_ratio:
+                        second_ratio = ratio
+                if best_ratio >= 0.55 and (best_ratio - second_ratio) >= 0.18:
+                    return best_cylinder_name
+            normalized = normalize_circle_parts_name(raw_name)
+            if normalized is not None and normalized in CIRCLE_PROFILE_BY_NAME:
+                return normalized
+        return raw_name
     except Exception as e:
         print(f"Parts name OCR failed: {e}")
     return None
@@ -746,6 +754,12 @@ def compose_session_id(arr, active_row, template_match):
 
 
 def detect_active_feeder_auto_tc(arr, active_row):
+    """Tri-state detector for the "Auto TC" feeder label on the active row.
+
+    Returns True when the label is confidently "Auto TC", False only when a
+    known non-Auto-TC label is confidently recognized, and None when feeder
+    text is unreadable or ambiguous so downstream routing does not force an
+    incorrect negative."""
     if active_row < 0:
         return None
 
@@ -756,16 +770,21 @@ def detect_active_feeder_auto_tc(arr, active_row):
 
     feeder_crop = arr[y_start_row:y_end_row, TABLE_FEEDER_TYPE_COL_SLICE]
     feeder_gray = cv2.cvtColor(feeder_crop, cv2.COLOR_RGB2GRAY)
-    feeder_text_gray = feeder_gray[4:24, :56]
-    matched_label = _match_known_text(
-        feeder_text_gray,
-        KNOWN_FEEDER_TYPE_LABELS,
-        max_width_delta=16,
-        max_height_delta=8,
-        max_score=0.50,
-    )
-    if matched_label is not None:
-        return matched_label == "Auto TC"
+
+    # Score "Auto TC" on multiple feeder text windows so small x-offsets do
+    # not miss the label.
+    for window in (feeder_gray[4:24, :56], feeder_gray[4:24, :64], feeder_gray[2:26, :56]):
+        if window.shape[0] < 6 or window.shape[1] < 8:
+            continue
+        matched_label = _match_known_text(
+            window,
+            KNOWN_FEEDER_TYPE_LABELS,
+            max_width_delta=16,
+            max_height_delta=8,
+            max_score=0.50,
+        )
+        if matched_label is not None:
+            return matched_label == "Auto TC"
 
     feeder_template_path = os.path.join(TEMPLATE_DIR, FEEDER_AUTO_TC_TEMPLATE)
     if not os.path.exists(feeder_template_path):
@@ -777,20 +796,44 @@ def detect_active_feeder_auto_tc(arr, active_row):
     if feeder_mask.shape != feeder_template.shape:
         return None
 
-    feeder_diff = cv2.absdiff(feeder_mask, feeder_template)
-    return float(np.count_nonzero(feeder_diff)) / float(feeder_diff.size) <= 0.01
+    # Relaxed template fallback: compare foreground bboxes with small
+    # positional tolerance and foreground overlap instead of near-pixel-perfect
+    # whole-mask comparison.
+    mask_bbox = _foreground_bbox(feeder_mask)
+    template_bbox = _foreground_bbox(feeder_template)
+    if mask_bbox is None or template_bbox is None:
+        # No bright foreground in the feeder cell — uncertain.
+        return None
+
+    mx0, my0, mx1, my1 = mask_bbox
+    tx0, ty0, tx1, ty1 = template_bbox
+    if (
+        abs(mx0 - tx0) > 4 or abs(my0 - ty0) > 3 or
+        abs(mx1 - tx1) > 4 or abs(my1 - ty1) > 3
+    ):
+        # Foreground present but clearly different from "Auto TC" template.
+        return False
+
+    template_fg = int(np.count_nonzero(feeder_template))
+    mask_fg = int(np.count_nonzero(feeder_mask))
+    if abs(mask_fg - template_fg) > max(40, int(template_fg * 0.15)):
+        return False
+
+    overlap = int(np.count_nonzero(cv2.bitwise_and(feeder_mask, feeder_template)))
+    if overlap >= int(template_fg * 0.85):
+        return True
+
+    return False
 
 
-def resolve_auto_shape_type(active_row, active_feeder_auto_tc, template_match):
+def resolve_auto_shape_type(active_row, active_feeder_auto_tc, template_match, active_parts_name=None):
     if active_row == -1:
         return None
     if active_feeder_auto_tc is True:
         return "circle"
-    if active_feeder_auto_tc is False:
-        if template_match is not None:
-            return "circle"
-        return "cylinder"
-    if template_match is None:
+    if template_match is not None:
+        return "circle"
+    if active_parts_name in KNOWN_CYLINDER_PART_NAME_SUFFIXES:
         return "cylinder"
     return None
 
@@ -3958,8 +4001,17 @@ def run_inference(image_b64, shape_type=None):
             if circle_res is not None:
                 return circle_res
         else:
-            auto_shape_type = resolve_auto_shape_type(active_row, active_feeder_auto_tc, template_match)
+            auto_shape_type = resolve_auto_shape_type(
+                active_row,
+                active_feeder_auto_tc,
+                template_match,
+                active_parts_name=active_parts_name,
+            )
             if auto_shape_type is None:
+                if active_feeder_auto_tc is False:
+                    cyl_res = detect_cylinder()
+                    if isinstance(cyl_res, dict) and cyl_res.get("left") is not None and cyl_res.get("right") is not None:
+                        return finalize_result(cyl_res, is_cylinder=True)
                 # No active row in the parts table — we have no template context,
                 # so we cannot reliably distinguish real parts from background.
                 # Return no-detection to prevent false positives.
