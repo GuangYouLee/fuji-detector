@@ -135,7 +135,91 @@ Clears all accumulated session data for large circle alignment.
 
 ---
 
-## 8. Installation & Setup
+## 8. Example Execution Scenarios
+
+Below are example payloads and response schemas demonstrating how the API handles different component types.
+
+### Scenario A: Circle Pattern Detection
+Returned when processing circular components (e.g., washers). All detected boundaries and the calculated `session_id` are returned.
+
+**Request payload:**
+```json
+{
+  "training_type": "FUJI_DETECTOR",
+  "img_base64": "iVBORw0KGgo...",
+  "shape_type": "circle"
+}
+```
+
+**Response payload:**
+```json
+{
+  "success": true,
+  "data": {
+    "top": [148, 251],
+    "bottom": [148, 359],
+    "left": [94, 305],
+    "right": [202, 305],
+    "session_id": "session_8_t0.15*9.0"
+  }
+}
+```
+
+### Scenario B: Cylinder Pattern Detection
+Returned when processing cylindrical components. Outputs the fitted `center`, the `left` and `right` edge boundaries, and sets circular geometry bounds to `null`.
+
+**Request payload:**
+```json
+{
+  "training_type": "FUJI_DETECTOR",
+  "img_base64": "iVBORw0KGgo...",
+  "shape_type": "cylinder"
+}
+```
+
+**Response payload:**
+```json
+{
+  "success": true,
+  "data": {
+    "top": null,
+    "bottom": null,
+    "left": [48, 404],
+    "right": [222, 301],
+    "center": [138, 352],
+    "radius": null
+  }
+}
+```
+
+### Scenario C: No Pattern Detected (Empty / Background Image)
+Returned when no active pattern is detected in the capture (e.g., empty background or no circle/cylinder matching parameters found). All boundary values are safely set to `null`.
+
+**Request payload:**
+```json
+{
+  "training_type": "FUJI_DETECTOR",
+  "img_base64": "iVBORw0KGgo...",
+  "shape_type": null
+}
+```
+
+**Response payload:**
+```json
+{
+  "success": true,
+  "data": {
+    "top": null,
+    "bottom": null,
+    "left": null,
+    "right": null
+  }
+}
+```
+
+---
+
+## 9. Installation & Setup
 
 ### Prerequisites
 Make sure Python 3.11+ is installed.
@@ -156,7 +240,7 @@ This boots up the waitress server hosting the API at `http://localhost:5000`.
 
 ---
 
-## 9. File Directory Overview
+## 10. File Directory Overview
 - [app.py](file:///C:/Users/Lee%20Guang%20You/Documents/BioE%20Repo/fuji-detect/app.py): Flask application entry point serving Waitress APIs.
 - [pipeline.py](file:///C:/Users/Lee%20Guang%20You/Documents/BioE%20Repo/fuji-detect/pipeline.py): Infers shape routing per training type.
 - [FUJI_DETECTOR/inspect.py](file:///C:/Users/Lee%20Guang%20You/Documents/BioE%20Repo/fuji-detect/FUJI_DETECTOR/inspect.py): Engine logic handling circle fitting, projection peak detection, and OCR.
