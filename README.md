@@ -135,8 +135,30 @@ Clears all accumulated session data for large circle alignment.
 
 ---
 
-## 8. Development & Files
-- [app.py](file:///C:/Users/Lee%20Guang%20You/Documents/BioE%20Repo/fuji-detect/app.py): Flask application file setting up waitress server.
-- [pipeline.py](file:///C:/Users/Lee%20Guang%20You/Documents/BioE%20Repo/fuji-detect/pipeline.py): Registry mapping handlers per training type.
-- [FUJI_DETECTOR/inspect.py](file:///C:/Users/Lee%20Guang%20You/Documents/BioE%20Repo/fuji-detect/FUJI_DETECTOR/inspect.py): Core computer vision implementation containing RANSAC, OCR and projection fitting.
-- [requirements.txt](file:///C:/Users/Lee%20Guang%20You/Documents/BioE%20Repo/fuji-detect/requirements.txt): Environment dependencies.
+## 8. Installation & Setup
+
+### Prerequisites
+Make sure Python 3.11+ is installed.
+
+### Setup Instructions
+1. Install Python package dependencies:
+   ```bash
+   pip install -r requirements.txt
+   ```
+2. Verify the configuration values inside [requirements.txt](file:///C:/Users/Lee%20Guang%20You/Documents/BioE%20Repo/fuji-detect/requirements.txt).
+
+### Starting the API Server
+Run the Flask-Waitress API server:
+```bash
+python app.py
+```
+This boots up the waitress server hosting the API at `http://localhost:5000`.
+
+---
+
+## 9. File Directory Overview
+- [app.py](file:///C:/Users/Lee%20Guang%20You/Documents/BioE%20Repo/fuji-detect/app.py): Flask application entry point serving Waitress APIs.
+- [pipeline.py](file:///C:/Users/Lee%20Guang%20You/Documents/BioE%20Repo/fuji-detect/pipeline.py): Infers shape routing per training type.
+- [FUJI_DETECTOR/inspect.py](file:///C:/Users/Lee%20Guang%20You/Documents/BioE%20Repo/fuji-detect/FUJI_DETECTOR/inspect.py): Engine logic handling circle fitting, projection peak detection, and OCR.
+- [requirements.txt](file:///C:/Users/Lee%20Guang%20You/Documents/BioE%20Repo/fuji-detect/requirements.txt): Version-pinned project dependencies.
+- [.gitignore](file:///C:/Users/Lee%20Guang%20You/Documents/BioE%20Repo/fuji-detect/.gitignore): Workspace files excluded from version control (OS files, IDE directories, tests, local dataset images, agent settings, and docker settings).
