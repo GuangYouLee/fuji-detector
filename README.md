@@ -262,7 +262,6 @@ This boots up the waitress server hosting the API at `http://localhost:5000`.
 
 ## 10. File Directory Overview
 - [app.py](file:///C:/Users/Lee%20Guang%20You/Documents/BioE%20Repo/fuji-detect/app.py): Flask application entry point serving Waitress APIs.
-- [pipeline.py](file:///C:/Users/Lee%20Guang%20You/Documents/BioE%20Repo/fuji-detect/pipeline.py): Infers shape routing per training type.
 - [FUJI_DETECTOR/inspect.py](file:///C:/Users/Lee%20Guang%20You/Documents/BioE%20Repo/fuji-detect/FUJI_DETECTOR/inspect.py): Engine logic handling circle fitting, projection peak detection, and OCR.
 - [requirements.txt](file:///C:/Users/Lee%20Guang%20You/Documents/BioE%20Repo/fuji-detect/requirements.txt): Version-pinned project dependencies.
-- [.gitignore](file:///C:/Users/Lee%20Guang%20You/Documents/BioE%20Repo/fuji-detect/.gitignore): Workspace files excluded from version control (OS files, IDE directories, tests, local dataset images, agent settings, and docker settings).
+- [.gitignore](file:///C:/Users/Lee%20Guang%20You/Documents/BioE%20Repo/fuji-detect/.gitignore): Workspace files excluded from version control (OS files, IDE directories, Python caches, local dataset images, and local agent working files).

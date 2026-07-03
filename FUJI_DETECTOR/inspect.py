@@ -272,10 +272,6 @@ def circle_from_3_points(p1, p2, p3):
     R = np.sqrt((x1 - ux)**2 + (y1 - uy)**2)
     return ux, uy, R
 
-def clear_sessions():
-    """No-op for session clearing."""
-    pass
-
 
 @lru_cache(maxsize=None)
 def _load_fuji_font(size):
@@ -1975,8 +1971,8 @@ def run_inference(image_b64, shape_type=None):
         parts_name_width = table_layout["parts_name_width"]
         no_col_slice = table_layout["no_col_slice"]
         no_col_width = table_layout["no_col_width"]
-        row_probe_left = 360
-        row_probe_right = 620
+        row_probe_left = min(table_arr.shape[1], scale_frame_x(table_arr, 360))
+        row_probe_right = min(table_arr.shape[1], scale_frame_x(table_arr, 620))
         row_averages = []
         row_midtone_scores = []
         row_medians = []

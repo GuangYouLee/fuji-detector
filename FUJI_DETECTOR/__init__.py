@@ -1,1 +1,0 @@
-# FUJI_DETECTOR package

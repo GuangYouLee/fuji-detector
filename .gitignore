@@ -68,14 +68,5 @@ fuji image/
 *.jpg
 *.jpeg
 
-# Test files and folder
-tests/
-integration_test.py
-
-# Agent rules and configuration
+# Local agent working files
 .agents/
-AGENTS.md
-
-# Docker
-Dockerfile
-docker-compose.yml

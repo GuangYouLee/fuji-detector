@@ -1,20 +1,10 @@
-import sys
-# Set integer string conversion limits to prevent issues with large data handling
-if not hasattr(sys, 'get_int_max_str_digits'):
-    sys.get_int_max_str_digits = lambda: 4300
-if not hasattr(sys, 'set_int_max_str_digits'):
-    sys.set_int_max_str_digits = lambda x: None
-
 import uuid
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import pipeline
+from FUJI_DETECTOR.inspect import run_inference as _run_fuji_inference
 
 app = Flask(__name__)
-if hasattr(app, 'json'):
-    app.json.sort_keys = False
-else:
-    app.config['JSON_SORT_KEYS'] = False
+app.json.sort_keys = False
 CORS(app)
 
 POINT_FIELDS = ("top", "bottom", "left", "right")
@@ -36,14 +26,44 @@ def _error(message, status=400):
     return jsonify({"data": {"message": message}, "success": False}), status
 
 
-def _get_required(data, *keys):
-    """Utility to retrieve required keys from the JSON request body."""
-    values = []
-    for key in keys:
-        if key not in data:
-            raise ValueError(f"Missing required field: '{key}'")
-        values.append(data[key])
-    return values if len(values) > 1 else values[0]
+def _request_data(default_training_type=None):
+    data = dict(request.get_json(silent=True) or {})
+    training_type = (
+        request.args.get("TRAINING_TYPE")
+        or request.args.get("training_type")
+        or data.get("training_type")
+        or default_training_type
+    )
+    if training_type is not None:
+        data["training_type"] = training_type
+    return data
+
+
+def _run_detection(data):
+    try:
+        if not data:
+            raise ValueError("Request body must be JSON.")
+
+        training_type = data.get("training_type")
+        if not training_type:
+            raise ValueError("Missing required field: 'training_type'")
+        if training_type != "FUJI_DETECTOR":
+            raise ValueError(f"Unsupported training_type: '{training_type}'. Available: ['FUJI_DETECTOR']")
+
+        image_b64 = data.get("img_base64")
+        if not image_b64:
+            raise ValueError("Missing required field: img_base64.")
+
+        result = _run_fuji_inference(image_b64, shape_type=data.get("shape_type"))
+    except ValueError as e:
+        return None, _error(str(e))
+    except Exception as e:
+        return None, _error(f"Inference failed: {e}", status=500)
+
+    if isinstance(result, dict) and "error" in result:
+        return None, _error(result["error"])
+
+    return result, None
 
 
 def _format_detector_response(result, requested_edge=None):
@@ -52,20 +72,12 @@ def _format_detector_response(result, requested_edge=None):
     if requested_edge is None:
         return result
 
-    selected_label = None
-    selected_message = None
-    for label in ((requested_edge,) if requested_edge else POINT_FIELDS):
-        point = result.get(label)
-        if point is None:
-            continue
-        selected_label = label.capitalize()
-        selected_message = f"x={point[0]},y={point[1]}"
-        break
+    point = result.get(requested_edge)
 
     return {
-        "execute_label": selected_label,
+        "execute_label": requested_edge.capitalize() if point is not None else None,
         "session_id": result.get("session_id"),
-        "message": selected_message,
+        "message": f"x={point[0]},y={point[1]}" if point is not None else None,
     }
 
 
@@ -95,50 +107,14 @@ def _format_all_edges(result):
 
 
 def _run_image_detection(data, requested_edge=None):
-    if not data:
-        return _error("Request body must be JSON.")
+    result, error = _run_detection(data)
+    if error:
+        return error
 
-    try:
-        training_type = _get_required(data, "training_type")
-    except ValueError as e:
-        return _error(str(e))
-
-    try:
-        handler = pipeline.get_handler(pipeline.INFER_HANDLERS, training_type)
-    except ValueError as e:
-        return _error(str(e))
-
-    image_b64 = data.get("img_base64")
-    if not image_b64:
-        return _error("Missing required field: img_base64.")
-
-    try:
-        if training_type == "FUJI_DETECTOR":
-            result = handler(image_b64, shape_type=data.get("shape_type"))
-        else:
-            result = handler(image_b64)
-    except TypeError:
-        result = handler(image_b64)
-    except Exception as e:
-        return _error(f"Inference failed: {e}", status=500)
-
-    if isinstance(result, dict) and "error" in result:
-        return _error(result["error"])
+    if requested_edge is not None and isinstance(result, dict) and result.get(requested_edge) is None:
+        return _error(f"Edge '{requested_edge}' was not detected in this image.")
 
     return _success(_format_detector_response(result, requested_edge=requested_edge))
-
-
-def _run_screen_detection(data, requested_edge=None):
-    data = dict(data or {})
-    # Support callers that supply the detector in the query string.
-    tt = (
-        request.args.get("TRAINING_TYPE")
-        or request.args.get("training_type")
-        or data.get("training_type")
-    )
-    if tt:
-        data["training_type"] = tt
-    return _run_image_detection(data, requested_edge=requested_edge)
 
 
 @app.route("/api/v1/process_image", methods=["POST"])
@@ -147,27 +123,27 @@ def process_image():
     Main inference endpoint. Matches training_type (e.g. FUJI_DETECTOR)
     and routes base64 encoded image to the correct handler.
     """
-    return _run_image_detection(request.get_json(silent=True))
+    return _run_image_detection(_request_data())
 
 
 @app.route("/api/v1/top", methods=["POST"])
 def process_image_top():
-    return _run_image_detection(request.get_json(silent=True), requested_edge="top")
+    return _run_image_detection(_request_data(), requested_edge="top")
 
 
 @app.route("/api/v1/bottom", methods=["POST"])
 def process_image_bottom():
-    return _run_image_detection(request.get_json(silent=True), requested_edge="bottom")
+    return _run_image_detection(_request_data(), requested_edge="bottom")
 
 
 @app.route("/api/v1/left", methods=["POST"])
 def process_image_left():
-    return _run_image_detection(request.get_json(silent=True), requested_edge="left")
+    return _run_image_detection(_request_data(), requested_edge="left")
 
 
 @app.route("/api/v1/right", methods=["POST"])
 def process_image_right():
-    return _run_image_detection(request.get_json(silent=True), requested_edge="right")
+    return _run_image_detection(_request_data(), requested_edge="right")
 
 
 @app.route("/api/v1/detect_screen", methods=["POST"])
@@ -175,133 +151,43 @@ def detect_screen():
     """
     Runs the shared image inference path using the posted base64 image.
     """
-    return _run_screen_detection(request.get_json(silent=True))
+    return _run_image_detection(_request_data())
 
 
 @app.route("/api/v1/detect_screen/top", methods=["POST"])
 def detect_screen_top():
-    return _run_screen_detection(request.get_json(silent=True), requested_edge="top")
+    return _run_image_detection(_request_data(), requested_edge="top")
 
 
 @app.route("/api/v1/detect_screen/bottom", methods=["POST"])
 def detect_screen_bottom():
-    return _run_screen_detection(request.get_json(silent=True), requested_edge="bottom")
+    return _run_image_detection(_request_data(), requested_edge="bottom")
 
 
 @app.route("/api/v1/detect_screen/left", methods=["POST"])
 def detect_screen_left():
-    return _run_screen_detection(request.get_json(silent=True), requested_edge="left")
+    return _run_image_detection(_request_data(), requested_edge="left")
 
 
 @app.route("/api/v1/detect_screen/right", methods=["POST"])
 def detect_screen_right():
-    return _run_screen_detection(request.get_json(silent=True), requested_edge="right")
+    return _run_image_detection(_request_data(), requested_edge="right")
 
 
 @app.route("/api/v1/detect_screen/all", methods=["POST"])
 def detect_screen_all():
-    """Run inference once and return all four boundary pixels in a single response.
-
-    Use this instead of calling /top, /bottom, /left, /right separately when
-    a full circle is expected — it avoids 4 redundant inference runs.
-
-    Response shape::
-
-        {
-          "success": true,
-          "data": {
-            "session_id": "...",
-            "edges": {
-              "top":    {"execute_label": "Top",    "message": "x=...,y=..."},
-              "bottom": {"execute_label": "Bottom", "message": "x=...,y=..."},
-              "left":   {"execute_label": "Left",   "message": "x=...,y=..."},
-              "right":  {"execute_label": "Right",  "message": "x=...,y=..."}
-            }
-          }
-        }
-
-    Any edge that was not detected will be ``null`` in the ``edges`` dict.
-    """
-    data = dict(request.get_json(silent=True) or {})
-    data["training_type"] = (
-        request.args.get("TRAINING_TYPE")
-        or request.args.get("training_type")
-        or data.get("training_type")
-        or "FUJI_DETECTOR"
-    )
-    if not data:
-        return _error("Request body must be JSON.")
-
-    try:
-        training_type = _get_required(data, "training_type")
-    except ValueError as e:
-        return _error(str(e))
-
-    try:
-        handler = pipeline.get_handler(pipeline.INFER_HANDLERS, training_type)
-    except ValueError as e:
-        return _error(str(e))
-
-    image_b64 = data.get("img_base64")
-    if not image_b64:
-        return _error("Missing required field: img_base64.")
-
-    try:
-        if training_type == "FUJI_DETECTOR":
-            result = handler(image_b64, shape_type=data.get("shape_type"))
-        else:
-            result = handler(image_b64)
-    except TypeError:
-        result = handler(image_b64)
-    except Exception as e:
-        return _error(f"Inference failed: {e}", status=500)
-
-    if isinstance(result, dict) and "error" in result:
-        return _error(result["error"])
+    """Run inference once and return all detected edges."""
+    result, error = _run_detection(_request_data(default_training_type="FUJI_DETECTOR"))
+    if error:
+        return error
 
     return _success(_format_all_edges(result))
 
 
 @app.route("/api/v1/detect_screen/next", methods=["POST"])
 def detect_screen_next():
-    """Round-robin endpoint: same URL, called 4 times, returns one edge per call.
-
-    **Call 1** — omit ``session_id`` (or send an unknown one):
-      Runs inference once, caches all four edges, returns ``Top``.
-      The response includes a ``session_id`` — pass it back on every
-      subsequent call so the server knows which cache slot to advance.
-
-    **Calls 2-4** — include the ``session_id`` from call 1:
-      No inference is run. Returns ``Bottom``, ``Left``, ``Right`` in order.
-      After the 4th call the cache slot is automatically cleared.
-
-    Request body::
-
-        {
-          "img_base64": "<base64>",     # required on call 1; ignored on 2-4
-          "session_id":  "<session id>", # omit on call 1, required on calls 2-4
-          "training_type": "FUJI_DETECTOR"  # optional, defaults to FUJI_DETECTOR
-        }
-
-    Response (same shape as the single-edge endpoints)::
-
-        {
-          "success": true,
-          "data": {
-            "execute_label": "Top",           # Top / Bottom / Left / Right
-            "message":       "x=123,y=45",
-            "session_id":    "session_2_t0.2*11.0",  # detector id, UUID fallback
-            "edges_remaining": 3              # how many edges are still queued
-          }
-        }
-    """
-    data = dict(request.get_json(silent=True) or {})
-    training_type = (
-        request.args.get("TRAINING_TYPE")
-        or request.args.get("training_type")
-        or data.get("training_type")
-        or "FUJI_DETECTOR"
-    )
+    """Return one edge per call, keyed by the transient sequence session_id."""
+    data = _request_data(default_training_type="FUJI_DETECTOR")
 
     session_id = data.get("session_id", "").strip()
 
@@ -339,23 +225,9 @@ def detect_screen_next():
             "Provide it on the first call (no session_id) to start a new sequence."
         )
 
-    try:
-        handler = pipeline.get_handler(pipeline.INFER_HANDLERS, training_type)
-    except ValueError as e:
-        return _error(str(e))
-
-    try:
-        if training_type == "FUJI_DETECTOR":
-            result = handler(image_b64, shape_type=data.get("shape_type"))
-        else:
-            result = handler(image_b64)
-    except TypeError:
-        result = handler(image_b64)
-    except Exception as e:
-        return _error(f"Inference failed: {e}", status=500)
-
-    if isinstance(result, dict) and "error" in result:
-        return _error(result["error"])
+    result, error = _run_detection(data)
+    if error:
+        return error
 
     # Build the ordered queue of edges that actually have a detected point.
     detected = [lbl for lbl in POINT_FIELDS if result.get(lbl) is not None]
@@ -366,11 +238,7 @@ def detect_screen_next():
     first_label = detected.pop(0)
     first_point = result[first_label]
 
-    detector_session_id = result.get("session_id")
-    if isinstance(detector_session_id, str):
-        detector_session_id = detector_session_id.strip()
-    if not detector_session_id:
-        detector_session_id = str(uuid.uuid4())
+    detector_session_id = str(uuid.uuid4())
 
     # Cache the remaining edges (may be empty if only 1 edge detected).
     if detected:

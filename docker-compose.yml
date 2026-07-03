@@ -1,0 +1,12 @@
+services:
+  api:
+    build: .
+    container_name: fuji_detect_api
+    ports:
+      - "5000:5000"
+    environment:
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped
+    volumes:
+      - ./FUJI_DETECTOR:/app/FUJI_DETECTOR
+      - ./app.py:/app/app.py
