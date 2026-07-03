@@ -101,13 +101,11 @@ Main inference endpoint. Matches `training_type` and routes base64 encoded image
 ```json
 {
   "training_type": "FUJI_DETECTOR",
-  "img_base64": "iVBORw0KGgo...",
-  "shape_type": "circle" 
+  "img_base64": "iVBORw0KGgo..."
 }
 ```
 * `training_type` (Required): Must be `"FUJI_DETECTOR"`.
 * `img_base64` (Required): Base64-encoded screenshot.
-* `shape_type` (Optional): `"circle"`, `"cylinder"`, or `null` for auto-detect.
 
 **Response (Success - Circle)**
 ```json
@@ -119,6 +117,31 @@ Main inference endpoint. Matches `training_type` and routes base64 encoded image
     "left": null,
     "right": null,
     "session_id": "session_2_t0.2*11.0"
+  }
+}
+```
+
+### POST `/api/v1/detect_screen/top?TRAINING_TYPE=FUJI_DETECTOR`
+Top-edge endpoint. It uses the posted base64 image from the JSON payload and reads the detector name from the `TRAINING_TYPE` query parameter.
+
+**Request Payload**
+```json
+{
+  "img_base64": "iVBORw0KGgo..."
+}
+```
+* `TRAINING_TYPE` (Required query parameter): Must be `"FUJI_DETECTOR"`.
+* `img_base64` (Required): Base64-encoded screenshot.
+
+**Response**
+Returns the selected edge in the compact response schema:
+```json
+{
+  "success": true,
+  "data": {
+    "execute_label": "Top",
+    "session_id": "session_2_t0.2*11.0",
+    "message": "x=139,y=341"
   }
 }
 ```
@@ -146,8 +169,7 @@ Returned when processing circular components (e.g., washers). All detected bound
 ```json
 {
   "training_type": "FUJI_DETECTOR",
-  "img_base64": "iVBORw0KGgo...",
-  "shape_type": "circle"
+  "img_base64": "iVBORw0KGgo..."
 }
 ```
 
@@ -172,8 +194,7 @@ Returned when processing cylindrical components. Outputs the fitted `center`, th
 ```json
 {
   "training_type": "FUJI_DETECTOR",
-  "img_base64": "iVBORw0KGgo...",
-  "shape_type": "cylinder"
+  "img_base64": "iVBORw0KGgo..."
 }
 ```
 
@@ -199,8 +220,7 @@ Returned when no active pattern is detected in the capture (e.g., empty backgrou
 ```json
 {
   "training_type": "FUJI_DETECTOR",
-  "img_base64": "iVBORw0KGgo...",
-  "shape_type": null
+  "img_base64": "iVBORw0KGgo..."
 }
 ```
 

@@ -12,6 +12,16 @@ import os
 
 TEMPLATE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates")
 FEEDER_AUTO_TC_TEMPLATE = "template_feeder_auto_tc.png"
+FUJI_FONT_CANDIDATES = (
+    os.path.join(TEMPLATE_DIR, "DejaVuSans.ttf"),
+    "tahoma.ttf",
+    "arial.ttf",
+    "micross.ttf",
+    os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts", "tahoma.ttf"),
+    os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts", "arial.ttf"),
+    os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts", "micross.ttf"),
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+)
 TABLE_FIRST_ROW_Y = 99
 TABLE_ROW_STRIDE = 30
 TABLE_VISIBLE_ROWS = 3
@@ -42,6 +52,196 @@ ALL_KNOWN_PART_NAMES = KNOWN_CYLINDER_PART_NAME_SUFFIXES + tuple(dict.fromkeys(
     list(CIRCLE_PROFILE_BY_NAME.keys()) +
     [key[:-2] for key in CIRCLE_PROFILE_BY_NAME if key.endswith(".0")]
 ))
+BASE_FRAME_WIDTH = 800
+BASE_FRAME_HEIGHT = 600
+TARGET_FRAME_SIZE = (BASE_FRAME_WIDTH, BASE_FRAME_HEIGHT)
+
+
+def normalize_fuji_frame_size(arr):
+    if arr.shape[1] == BASE_FRAME_WIDTH and arr.shape[0] == BASE_FRAME_HEIGHT:
+        return arr
+    return cv2.resize(arr, TARGET_FRAME_SIZE, interpolation=cv2.INTER_AREA)
+
+
+def get_frame_scale_x(arr):
+    return arr.shape[1] / float(BASE_FRAME_WIDTH)
+
+
+def get_frame_scale_y(arr):
+    return arr.shape[0] / float(BASE_FRAME_HEIGHT)
+
+
+def get_frame_uniform_scale(arr):
+    return (get_frame_scale_x(arr) + get_frame_scale_y(arr)) / 2.0
+
+
+def scale_frame_x(arr, value):
+    return int(round(value * get_frame_scale_x(arr)))
+
+
+def scale_frame_y(arr, value):
+    return int(round(value * get_frame_scale_y(arr)))
+
+
+def scale_frame_len(arr, value):
+    return max(1, int(round(value * get_frame_uniform_scale(arr))))
+
+
+def scale_frame_x_slice(arr, col_slice):
+    return slice(scale_frame_x(arr, col_slice.start), scale_frame_x(arr, col_slice.stop))
+
+
+def get_table_layout(arr):
+    no_col_slice = scale_frame_x_slice(arr, TABLE_NO_COL_SLICE)
+    if get_frame_uniform_scale(arr) >= 1.15:
+        no_col_slice = slice(no_col_slice.start + 5, no_col_slice.stop + 5)
+    return {
+        "row_y_start": scale_frame_y(arr, TABLE_FIRST_ROW_Y),
+        "row_height": scale_frame_len(arr, 29),
+        "row_stride": scale_frame_len(arr, TABLE_ROW_STRIDE),
+        "no_col_slice": no_col_slice,
+        "no_col_width": TABLE_NO_COL_SLICE.stop - TABLE_NO_COL_SLICE.start,
+        "parts_name_slice": scale_frame_x_slice(arr, TABLE_PARTS_NAME_COL_SLICE),
+        "parts_name_width": TABLE_PARTS_NAME_COL_SLICE.stop - TABLE_PARTS_NAME_COL_SLICE.start,
+        "feeder_slice": scale_frame_x_slice(arr, TABLE_FEEDER_TYPE_COL_SLICE),
+        "feeder_width": TABLE_FEEDER_TYPE_COL_SLICE.stop - TABLE_FEEDER_TYPE_COL_SLICE.start,
+    }
+
+
+def scale_radius_ranges(ranges, scale):
+    return [
+        (max(1, int(round(low * scale))), max(1, int(round(high * scale))))
+        for low, high in ranges
+    ]
+
+
+def normalize_text_crop(crop, target_width, target_height):
+    if crop.size == 0:
+        return crop
+    if crop.shape[1] == target_width and crop.shape[0] == target_height:
+        return crop
+    return cv2.resize(crop, (target_width, target_height), interpolation=cv2.INTER_AREA)
+
+
+def infer_circle_session_suffix(template_match, active_parts_name, radius):
+    explicit_suffix = template_match or active_parts_name
+    resolved_profile = resolve_circle_profile_from_name(explicit_suffix)
+    if resolved_profile is not None:
+        if radius is None:
+            return resolved_profile[0]
+        _, _, nominal_radius, _ = resolved_profile
+        tolerance = max(14.0, nominal_radius * 0.30)
+        if abs(float(radius) - float(nominal_radius)) <= tolerance:
+            return resolved_profile[0]
+
+    if radius is None:
+        return None
+
+    canonical_profiles = {}
+    for _, profile in CIRCLE_PROFILE_BY_NAME.items():
+        canonical_profiles[profile[0]] = profile
+
+    best_name = None
+    best_gap = float("inf")
+    for canonical_name, (_, _, nominal_radius, _) in canonical_profiles.items():
+        gap = abs(float(radius) - float(nominal_radius))
+        if gap < best_gap:
+            best_gap = gap
+            best_name = canonical_name
+
+    if best_name is None:
+        return None
+
+    _, _, nominal_radius, _ = canonical_profiles[best_name]
+    tolerance = max(14.0, nominal_radius * 0.30)
+    return best_name if best_gap <= tolerance else None
+
+
+def should_reject_partial_small_circle(shape_type, template_kind, visible_names):
+    return (
+        shape_type != "circle" and
+        template_kind == "small" and
+        visible_names in (("right",), ("bottom",), ("bottom", "right"))
+    )
+
+
+def should_try_uncertain_circle_fallback(active_row, active_feeder_auto_tc, auto_shape_type):
+    return (
+        auto_shape_type is None and
+        active_row != -1 and
+        active_feeder_auto_tc is not False
+    )
+
+
+def has_large_washer_evidence(edge_mask):
+    if edge_mask is None or edge_mask.size == 0:
+        return False
+
+    height, width = edge_mask.shape[:2]
+    scale = height / 254.0
+    band = max(1, int(round(18 * scale)))
+    center_start = max(0, int(round(60 * scale)))
+    center_stop = min(height, int(round(194 * scale)))
+    side_threshold = max(18, int(round(45 * scale)))
+    if center_stop <= center_start:
+        return False
+
+    central_rows = slice(center_start, center_stop)
+    central_cols = slice(center_start, min(width, int(round(194 * (width / 254.0)))))
+    side_scores = [
+        int(np.count_nonzero(edge_mask[:band, central_cols])),
+        int(np.count_nonzero(edge_mask[-band:, central_cols])),
+        int(np.count_nonzero(edge_mask[central_rows, :band])),
+        int(np.count_nonzero(edge_mask[central_rows, -band:])),
+    ]
+    return max(side_scores) >= side_threshold
+
+
+def resolve_large_center_mode_from_quadrants(top_mean, bottom_mean, left_mean, right_mean):
+    darkest_side = min(
+        (
+            ("top", float(top_mean)),
+            ("bottom", float(bottom_mean)),
+            ("left", float(left_mean)),
+            ("right", float(right_mean)),
+        ),
+        key=lambda item: item[1],
+    )[0]
+    opposite_side = {
+        "top": "bottom",
+        "bottom": "top",
+        "left": "right",
+        "right": "left",
+    }
+    return opposite_side[darkest_side]
+
+
+def scale_detector_result_to_original_frame(result, scale_x, scale_y):
+    if not isinstance(result, dict):
+        return result
+
+    if scale_x == 1.0 and scale_y == 1.0:
+        return result
+
+    scaled = dict(result)
+
+    def scale_point(point):
+        if point is None:
+            return None
+        return [
+            int(round(point[0] * scale_x)),
+            int(round(point[1] * scale_y)),
+        ]
+
+    for key in ("top", "bottom", "left", "right", "center"):
+        if key in scaled:
+            scaled[key] = scale_point(scaled[key])
+
+    if "radius" in scaled and scaled["radius"] is not None:
+        scaled["radius"] = float(scaled["radius"]) * ((scale_x + scale_y) / 2.0)
+
+    return scaled
+
 
 def fit_circle_algebraic(x, y):
     """Fits a circle to points (x, y) using algebraic least squares."""
@@ -62,11 +262,11 @@ def circle_from_3_points(p1, p2, p3):
     x1, y1 = p1
     x2, y2 = p2
     x3, y3 = p3
-    
+
     d = 2 * (x1 * (y2 - y3) + x2 * (y3 - y1) + x3 * (y1 - y2))
     if abs(d) < 1e-6:
         return None
-    
+
     ux = ((x1**2 + y1**2) * (y2 - y3) + (x2**2 + y2**2) * (y3 - y1) + (x3**2 + y3**2) * (y1 - y2)) / d
     uy = ((x1**2 + y1**2) * (x3 - x2) + (x2**2 + y2**2) * (x1 - x3) + (x3**2 + y3**2) * (x2 - x1)) / d
     R = np.sqrt((x1 - ux)**2 + (y1 - uy)**2)
@@ -76,21 +276,26 @@ def clear_sessions():
     """No-op for session clearing."""
     pass
 
+
+@lru_cache(maxsize=None)
+def _load_fuji_font(size):
+    import PIL.ImageFont as ImageFont
+
+    for fp in FUJI_FONT_CANDIDATES:
+        if not fp:
+            continue
+        try:
+            return ImageFont.truetype(fp, size)
+        except OSError:
+            continue
+    return ImageFont.load_default()
+
 @lru_cache(maxsize=1)
 def _digit_templates():
     import PIL.Image as PILImage
     import PIL.ImageDraw as ImageDraw
-    import PIL.ImageFont as ImageFont
 
-    font = None
-    for fp in ["tahoma.ttf", "arial.ttf", "micross.ttf"]:
-        try:
-            font = ImageFont.truetype(fp, 11)
-            break
-        except OSError:
-            continue
-    if font is None:
-        font = ImageFont.load_default()
+    font = _load_fuji_font(11)
 
     templates = {}
     for digit in "0123456789":
@@ -121,17 +326,8 @@ def _match_digit(char_img):
 def _parts_name_templates():
     import PIL.Image as PILImage
     import PIL.ImageDraw as ImageDraw
-    import PIL.ImageFont as ImageFont
 
-    font = None
-    for fp in ["tahoma.ttf", "arial.ttf", "micross.ttf"]:
-        try:
-            font = ImageFont.truetype(fp, 11)
-            break
-        except OSError:
-            continue
-    if font is None:
-        font = ImageFont.load_default()
+    font = _load_fuji_font(11)
 
     templates = {}
     for char in "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.*/":
@@ -158,25 +354,13 @@ def _match_parts_name_char(char_img):
     return best_char, min_diff
 
 
-@lru_cache(maxsize=1)
-def _parts_name_font():
-    import PIL.ImageFont as ImageFont
-
-    for fp in ["tahoma.ttf", "arial.ttf", "micross.ttf"]:
-        try:
-            return ImageFont.truetype(fp, 11)
-        except OSError:
-            continue
-    return ImageFont.load_default()
-
-
 def _render_parts_name_mask(text, size, x_offset, y_offset):
     import PIL.Image as PILImage
     import PIL.ImageDraw as ImageDraw
 
     img = PILImage.new("L", size, 0)
     draw = ImageDraw.Draw(img)
-    draw.text((x_offset, y_offset), text, font=_parts_name_font(), fill=255)
+    draw.text((x_offset, y_offset), text, font=_load_fuji_font(11), fill=255)
     return np.array(img)
 
 
@@ -185,6 +369,55 @@ def _foreground_bbox(mask):
     if len(xs) == 0 or len(ys) == 0:
         return None
     return (int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1)
+
+
+def score_parts_name_template_match(actual_mask, template_mask):
+    actual_bbox = _foreground_bbox(actual_mask)
+    template_bbox = _foreground_bbox(template_mask)
+    if actual_bbox is None or template_bbox is None:
+        return float("inf"), float("inf")
+
+    ax0, ay0, ax1, ay1 = actual_bbox
+    tx0, ty0, tx1, ty1 = template_bbox
+    actual_crop = actual_mask[ay0:ay1, ax0:ax1]
+    template_crop = template_mask[ty0:ty1, tx0:tx1]
+
+    actual_h, actual_w = actual_crop.shape[:2]
+    template_h, template_w = template_crop.shape[:2]
+    compare_w = max(actual_w, template_w)
+    compare_h = max(actual_h, template_h)
+    actual_canvas = np.zeros((compare_h, compare_w), dtype=np.uint8)
+    template_canvas = np.zeros((compare_h, compare_w), dtype=np.uint8)
+    actual_canvas[:actual_h, :actual_w] = actual_crop
+    template_canvas[:template_h, :template_w] = template_crop
+
+    raw_diff = float(np.mean(cv2.absdiff(actual_canvas, template_canvas)))
+    actual_fg = actual_canvas > 0
+    template_fg = template_canvas > 0
+    intersection = float(np.count_nonzero(actual_fg & template_fg))
+    actual_count = float(np.count_nonzero(actual_fg))
+    template_count = float(np.count_nonzero(template_fg))
+    if actual_count == 0.0 or template_count == 0.0:
+        return float("inf"), float("inf")
+    precision = intersection / template_count
+    recall = intersection / actual_count
+    if precision + recall == 0.0:
+        f1_penalty = 1.0
+    else:
+        f1_penalty = 1.0 - ((2.0 * precision * recall) / (precision + recall))
+    width_penalty = abs(template_w - actual_w) / float(max(template_w, actual_w, 1))
+    height_penalty = abs(template_h - actual_h) / float(max(template_h, actual_h, 1))
+    density_actual = float(np.count_nonzero(actual_canvas)) / float(actual_canvas.size)
+    density_template = float(np.count_nonzero(template_canvas)) / float(template_canvas.size)
+    density_penalty = abs(density_actual - density_template)
+    score = (
+        raw_diff +
+        (55.0 * f1_penalty) +
+        (22.0 * width_penalty) +
+        (12.0 * height_penalty) +
+        (28.0 * density_penalty)
+    )
+    return raw_diff, score
 
 
 def _generate_text_masks(gray):
@@ -396,6 +629,50 @@ def resolve_circle_profile_from_name(parts_name):
     return None
 
 
+def resolve_circle_profile_fallback(
+    best_template,
+    best_10mm_name,
+    best_10mm_score,
+    second_10mm_score,
+    best_9mm_name=None,
+    best_9mm_score=float("inf"),
+    second_9mm_score=float("inf"),
+):
+    if (
+        best_9mm_name is not None and
+        best_9mm_score <= 0.85 and
+        (
+            second_9mm_score == float("inf") or
+            (second_9mm_score - best_9mm_score) >= 0.004
+        )
+    ):
+        return resolve_circle_profile_from_name(best_9mm_name)
+
+    if (
+        best_10mm_name is not None and
+        best_10mm_score <= 0.68 and
+        (
+            second_10mm_score == float("inf") or
+            (second_10mm_score - best_10mm_score) >= 0.01
+        )
+    ):
+        return resolve_circle_profile_from_name(best_10mm_name)
+
+    if best_template is not None and best_template[1] == "template_11_0.png" and best_template[6] <= 12.0:
+        return resolve_circle_profile_from_name("t0.2*11.0")
+
+    return None
+
+
+def resolve_circle_profile_with_template_override(active_parts_name, best_template):
+    parts_name_profile = resolve_circle_profile_from_name(active_parts_name)
+    if best_template is not None and best_template[1] == "template_11_0.png" and best_template[7] <= 10.0:
+        # Whole-name OCR can collapse 11.0 rows into nearby medium profiles.
+        # When the dedicated 11.0 row mask matches, keep the large profile.
+        return resolve_circle_profile_from_name("t0.2*11.0")
+    return parts_name_profile
+
+
 def _ocr_part_number_from_crop(no_crop):
     gray = cv2.cvtColor(no_crop, cv2.COLOR_RGB2GRAY)
     gray = cv2.GaussianBlur(gray, (3, 3), 0)
@@ -419,6 +696,17 @@ def _ocr_part_number_from_crop(no_crop):
             char_boxes.append((x, y, w_c, h_c))
 
         char_boxes.sort(key=lambda box: box[0])
+        if len(char_boxes) >= 2:
+            left_box = char_boxes[0]
+            next_box = char_boxes[1]
+            x0, y0, w_c, h_c = left_box
+            if (
+                x0 <= 4 and
+                w_c <= 5 and
+                h_c <= 5 and
+                next_box[0] >= x0 + w_c
+            ):
+                char_boxes = char_boxes[1:]
 
         digits = []
         scores = []
@@ -457,7 +745,7 @@ def _classify_single_digit_token(token):
         return "6"
     if left_count <= 2 and top_count >= 3 and bottom_count >= 3:
         return "3"
-    if left_count >= 3 and right_count >= 3 and middle_row >= 2 and bottom_count <= 2:
+    if left_count >= 2 and right_count >= 3 and middle_row >= 2 and bottom_count <= 2:
         return "4"
     if left_count >= 4 and right_count <= 3 and top_count >= 3 and bottom_count >= 3:
         return "5"
@@ -522,6 +810,39 @@ def _read_active_row_part_number(no_crop):
     return _ocr_part_number_from_crop(no_crop)
 
 
+def _has_selected_row_marker(no_crop):
+    gray = cv2.cvtColor(no_crop, cv2.COLOR_RGB2GRAY)
+    focus = gray[2:18, 64:77]
+    _, thresh = cv2.threshold(focus, 205, 255, cv2.THRESH_BINARY)
+    num_labels, _, stats, _ = cv2.connectedComponentsWithStats(thresh, 8)
+
+    boxes = []
+    for idx in range(1, num_labels):
+        x, y, w_c, h_c, area = stats[idx]
+        if area < 2:
+            continue
+        if y == 0 and h_c <= 2:
+            continue
+        boxes.append((x, y, w_c, h_c, area))
+
+    if len(boxes) < 2:
+        return False
+
+    boxes.sort(key=lambda box: box[0])
+    left_box = boxes[0]
+    next_box = boxes[1]
+    left_area = left_box[4]
+    remaining_area = sum(box[4] for box in boxes[1:])
+    return (
+        left_box[0] <= 4 and
+        left_box[2] <= 5 and
+        left_box[3] <= 5 and
+        left_area <= 12 and
+        remaining_area >= left_area and
+        next_box[0] >= left_box[0] + left_box[2]
+    )
+
+
 def _resolve_visible_row_numbers(values, excluded_indices=None):
     excluded = set(excluded_indices or ())
     anchors = [
@@ -546,6 +867,68 @@ def _get_visible_row_anchor_span(values, excluded_indices=None):
     if len(anchors) < 2:
         return 0
     return max(anchors) - min(anchors)
+
+
+def _iter_active_row_y_offsets(arr):
+    if get_frame_uniform_scale(arr) < 1.15:
+        return (0,)
+    return (0, -6, 6, -12, 12, -18, 18, -24)
+
+
+def _resolve_active_part_number(active_digits, visible_numbers, active_row):
+    neighbor_anchor_span = _get_visible_row_anchor_span(visible_numbers, excluded_indices={active_row})
+    if neighbor_anchor_span > 3:
+        if active_digits and active_digits.isdigit() and 1 <= int(active_digits) <= 9:
+            return active_digits
+        if all(value is None or value >= 10 for value in visible_numbers):
+            return str(active_row + 1)
+
+    resolved_from_neighbors = _resolve_visible_row_numbers(visible_numbers, excluded_indices={active_row})
+    if 0 <= active_row < len(resolved_from_neighbors) and resolved_from_neighbors[active_row] is not None:
+        return str(resolved_from_neighbors[active_row])
+
+    resolved_numbers = _resolve_visible_row_numbers(visible_numbers)
+    if 0 <= active_row < len(resolved_numbers) and resolved_numbers[active_row] is not None:
+        return str(resolved_numbers[active_row])
+    if active_digits:
+        return active_digits
+    return None
+
+
+def _score_active_part_number_candidate(candidate, active_digits, visible_numbers, active_row):
+    if candidate is None or not str(candidate).isdigit():
+        return None
+
+    candidate_int = int(candidate)
+    recognized_count = sum(value is not None for value in visible_numbers)
+    neighbor_anchor_span = _get_visible_row_anchor_span(visible_numbers, excluded_indices={active_row})
+    resolved_from_neighbors = _resolve_visible_row_numbers(visible_numbers, excluded_indices={active_row})
+    neighbor_value = (
+        resolved_from_neighbors[active_row]
+        if 0 <= active_row < len(resolved_from_neighbors)
+        else None
+    )
+    resolved_numbers = _resolve_visible_row_numbers(visible_numbers)
+    resolved_value = (
+        resolved_numbers[active_row]
+        if 0 <= active_row < len(resolved_numbers)
+        else None
+    )
+
+    active_is_single_digit = active_digits is not None and active_digits.isdigit() and len(active_digits) == 1
+    active_value = int(active_digits) if active_digits and active_digits.isdigit() else None
+    active_gap = abs(active_value - candidate_int) if active_value is not None else 0
+
+    return (
+        -recognized_count,
+        0 if neighbor_value == candidate_int else 1,
+        0 if resolved_value == candidate_int else 1,
+        0 if active_is_single_digit else 1,
+        neighbor_anchor_span,
+        active_gap,
+        abs(candidate_int - (active_row + 1)),
+        candidate_int,
+    )
 
 
 def _extract_text_boxes(thresh, min_width=2, max_width=22, min_height=6, max_height=20, min_area=8):
@@ -635,50 +1018,245 @@ def _ocr_parts_name_from_crop(name_crop):
     return candidates[0][0]
 
 
+def _read_parts_name_from_crop(name_crop):
+    gray = cv2.cvtColor(name_crop, cv2.COLOR_RGB2GRAY)
+    best_name, best_score, second_score = _rank_text_candidates(gray, ALL_KNOWN_PART_NAMES, 6, 4)
+    best_9mm_name, best_9mm_score, second_9mm_score = _rank_text_candidates(
+        gray,
+        ("t0.15*9.0", "t0.15*9", "t0.2*9.0", "t0.2*9"),
+        8,
+        5,
+    )
+    matched_9mm_name = _match_known_text(
+        gray,
+        ("t0.15*9.0", "t0.15*9", "t0.2*9.0", "t0.2*9"),
+        max_width_delta=18,
+        max_height_delta=10,
+        max_score=0.95,
+    )
+    if matched_9mm_name is not None:
+        normalized = normalize_circle_parts_name(matched_9mm_name)
+        if normalized is not None and normalized in CIRCLE_PROFILE_BY_NAME:
+            return normalized, (0, best_9mm_score, second_9mm_score)
+    if (
+        best_9mm_name is not None and
+        best_9mm_score <= 0.85 and
+        (second_9mm_score == float("inf") or (second_9mm_score - best_9mm_score) >= 0.004) and
+        (
+            best_name is None or
+            best_name not in ("t0.15*9.0", "t0.15*9", "t0.2*9.0", "t0.2*9") or
+            best_9mm_score <= best_score + 0.20
+        )
+    ):
+        normalized = normalize_circle_parts_name(best_9mm_name)
+        if normalized is not None and normalized in CIRCLE_PROFILE_BY_NAME:
+            return normalized, (1, best_9mm_score, second_9mm_score)
+    if (
+        best_name is not None and
+        best_score <= 0.60 and
+        (second_score == float("inf") or (second_score - best_score) >= 0.01)
+    ):
+        if best_name in KNOWN_CYLINDER_PART_NAME_SUFFIXES:
+            return best_name, (2, best_score, second_score)
+        normalized = normalize_circle_parts_name(best_name)
+        if normalized is not None and normalized in CIRCLE_PROFILE_BY_NAME:
+            return normalized, (2, best_score, second_score)
+        return best_name, (3, best_score, second_score)
+
+    raw_name = _sanitize_parts_name(_ocr_parts_name_from_crop(name_crop))
+    if raw_name is not None:
+        normalized_raw_name = "".join(ch for ch in raw_name.upper() if ch.isalnum())
+        if len(normalized_raw_name) >= 6:
+            best_ratio, second_ratio = 0.0, 0.0
+            best_cylinder_name = None
+            for candidate in KNOWN_CYLINDER_PART_NAME_SUFFIXES:
+                ratio = SequenceMatcher(
+                    None,
+                    normalized_raw_name,
+                    "".join(ch for ch in candidate.upper() if ch.isalnum()),
+                ).ratio()
+                if ratio > best_ratio:
+                    second_ratio = best_ratio
+                    best_ratio = ratio
+                    best_cylinder_name = candidate
+                elif ratio > second_ratio:
+                    second_ratio = ratio
+            if best_ratio >= 0.55 and (best_ratio - second_ratio) >= 0.18:
+                return best_cylinder_name, (4, -best_ratio, -second_ratio)
+        normalized = normalize_circle_parts_name(raw_name)
+        if normalized is not None and normalized in CIRCLE_PROFILE_BY_NAME:
+            return normalized, (5, 0.0, 0.0)
+        return raw_name, (6, 0.0, 0.0)
+
+    return None, None
+
+
+def _probe_active_row_parts_name(arr, active_row, row_y_start, row_height, row_stride, parts_name_slice, parts_name_width):
+    best_name = None
+    best_score = None
+    best_offset = None
+
+    for y_offset in _iter_active_row_y_offsets(arr):
+        active_y_start = row_y_start + active_row * row_stride + y_offset
+        active_y_end = active_y_start + row_height
+        if active_y_start < 0 or active_y_end > arr.shape[0]:
+            continue
+
+        name_crop = normalize_text_crop(
+            arr[active_y_start:active_y_end, parts_name_slice],
+            parts_name_width,
+            29,
+        )
+        candidate_name, candidate_score = _read_parts_name_from_crop(name_crop)
+        if candidate_name is None or candidate_score is None:
+            continue
+        if best_score is None or candidate_score < best_score:
+            best_name = candidate_name
+            best_score = candidate_score
+            best_offset = y_offset
+
+    return best_name, best_score, best_offset
+
+
+def _has_ambiguous_small_medium_parts_name(arr, active_row, row_y_start, row_height, row_stride, parts_name_slice, parts_name_width):
+    best_small_score = float("inf")
+    best_medium_score = float("inf")
+    small_matched = False
+    medium_matched = False
+
+    for y_offset in _iter_active_row_y_offsets(arr):
+        active_y_start = row_y_start + active_row * row_stride + y_offset
+        active_y_end = active_y_start + row_height
+        if active_y_start < 0 or active_y_end > arr.shape[0]:
+            continue
+
+        name_crop = normalize_text_crop(
+            arr[active_y_start:active_y_end, parts_name_slice],
+            parts_name_width,
+            29,
+        )
+        gray = cv2.cvtColor(name_crop, cv2.COLOR_RGB2GRAY)
+
+        small_name, small_score, _ = _rank_text_candidates(gray, ("t0.3*2.0",), 12, 8)
+        medium_name, medium_score, _ = _rank_text_candidates(
+            gray,
+            ("t0.15*9.0", "t0.15*9", "t0.2*9.0", "t0.2*9"),
+            12,
+            8,
+        )
+        if small_name is not None:
+            small_matched = True
+            best_small_score = min(best_small_score, small_score)
+        if medium_name is not None:
+            medium_matched = True
+            best_medium_score = min(best_medium_score, medium_score)
+
+        if _match_known_text(gray, ("t0.3*2.0",), 18, 10, 1.2) is not None:
+            small_matched = True
+        if _match_known_text(gray, ("t0.15*9.0", "t0.15*9", "t0.2*9.0", "t0.2*9"), 18, 10, 1.2) is not None:
+            medium_matched = True
+
+    return (
+        small_matched and
+        medium_matched and
+        (
+            best_small_score == float("inf") or
+            best_medium_score == float("inf") or
+            best_small_score <= best_medium_score + 0.10
+        )
+    )
+
+
 def ocr_part_number(arr, active_row):
     """Recognizes the part number for the active visible row from the No. column."""
     try:
         if active_row < 0:
             return None
 
-        active_digits = None
-        active_y_start = TABLE_FIRST_ROW_Y + active_row * TABLE_ROW_STRIDE
-        active_y_end = active_y_start + 29
-        if active_y_end <= arr.shape[0]:
-            active_crop = arr[active_y_start:active_y_end, TABLE_NO_COL_SLICE]
+        table_layout = get_table_layout(arr)
+        row_y_start = table_layout["row_y_start"]
+        row_height = table_layout["row_height"]
+        row_stride = table_layout["row_stride"]
+        no_col_slice = table_layout["no_col_slice"]
+        no_col_width = table_layout["no_col_width"]
+        parts_name_slice = table_layout["parts_name_slice"]
+        parts_name_width = table_layout["parts_name_width"]
+
+        _, _, preferred_offset = _probe_active_row_parts_name(
+            arr,
+            active_row,
+            row_y_start,
+            row_height,
+            row_stride,
+            parts_name_slice,
+            parts_name_width,
+        )
+
+        active_y_start = row_y_start + active_row * row_stride
+        active_y_end = active_y_start + row_height
+        if get_frame_uniform_scale(arr) >= 1.15 and 0 <= active_y_start and active_y_end <= arr.shape[0]:
+            active_crop = normalize_text_crop(
+                arr[active_y_start:active_y_end, no_col_slice],
+                no_col_width,
+                29,
+            )
             active_digits = _read_active_row_part_number(active_crop)
-
-        visible_numbers = []
-        for idx in range(TABLE_VISIBLE_ROWS):
-            y_start = TABLE_FIRST_ROW_Y + idx * TABLE_ROW_STRIDE
-            y_end = y_start + 29
-            if y_end > arr.shape[0]:
-                visible_numbers.append(None)
-                continue
-
-            no_crop = arr[y_start:y_end, TABLE_NO_COL_SLICE]
-            if idx == active_row and active_digits is not None:
-                digits = active_digits
-            else:
-                digits = _ocr_part_number_from_crop(no_crop)
-            visible_numbers.append(int(digits) if digits else None)
-
-        neighbor_anchor_span = _get_visible_row_anchor_span(visible_numbers, excluded_indices={active_row})
-        if neighbor_anchor_span > 3:
             if active_digits and active_digits.isdigit() and 1 <= int(active_digits) <= 9:
                 return active_digits
-            if all(value is None or value >= 10 for value in visible_numbers):
-                return str(active_row + 1)
 
-        resolved_from_neighbors = _resolve_visible_row_numbers(visible_numbers, excluded_indices={active_row})
-        if 0 <= active_row < len(resolved_from_neighbors) and resolved_from_neighbors[active_row] is not None:
-            return str(resolved_from_neighbors[active_row])
+        y_offsets = list(_iter_active_row_y_offsets(arr))
+        if preferred_offset in y_offsets:
+            y_offsets.remove(preferred_offset)
+            y_offsets.insert(0, preferred_offset)
 
-        resolved_numbers = _resolve_visible_row_numbers(visible_numbers)
-        if 0 <= active_row < len(resolved_numbers) and resolved_numbers[active_row] is not None:
-            return str(resolved_numbers[active_row])
-        if active_digits:
-            return active_digits
+        best_candidate = None
+        best_score = None
+        prefer_active_digit = get_frame_uniform_scale(arr) >= 1.15
+
+        for y_offset in y_offsets:
+            active_digits = None
+            active_y_start = row_y_start + active_row * row_stride + y_offset
+            active_y_end = active_y_start + row_height
+            if active_y_start < 0 or active_y_end > arr.shape[0]:
+                continue
+
+            active_crop = normalize_text_crop(
+                arr[active_y_start:active_y_end, no_col_slice],
+                no_col_width,
+                29,
+            )
+            active_digits = _read_active_row_part_number(active_crop)
+
+            visible_numbers = []
+            for idx in range(TABLE_VISIBLE_ROWS):
+                y_start = row_y_start + idx * row_stride + y_offset
+                y_end = y_start + row_height
+                if y_start < 0 or y_end > arr.shape[0]:
+                    visible_numbers.append(None)
+                    continue
+
+                no_crop = normalize_text_crop(
+                    arr[y_start:y_end, no_col_slice],
+                    no_col_width,
+                    29,
+                )
+                if idx == active_row and active_digits is not None:
+                    digits = active_digits
+                else:
+                    digits = _ocr_part_number_from_crop(no_crop)
+                visible_numbers.append(int(digits) if digits and digits.isdigit() else None)
+
+            if prefer_active_digit and active_digits and active_digits.isdigit() and 1 <= int(active_digits) <= 9:
+                candidate = active_digits
+            else:
+                candidate = _resolve_active_part_number(active_digits, visible_numbers, active_row)
+            score = _score_active_part_number_candidate(candidate, active_digits, visible_numbers, active_row)
+            if score is not None and (best_score is None or score < best_score):
+                best_score = score
+                best_candidate = candidate
+
+        if best_candidate is not None:
+            return best_candidate
     except Exception as e:
         print(f"OCR failed: {e}")
     return None
@@ -690,51 +1268,22 @@ def ocr_parts_name(arr, active_row):
         if active_row < 0:
             return None
 
-        active_y_start = TABLE_FIRST_ROW_Y + active_row * TABLE_ROW_STRIDE
-        active_y_end = active_y_start + 29
-        if active_y_end > arr.shape[0]:
-            return None
-
-        name_crop = arr[active_y_start:active_y_end, TABLE_PARTS_NAME_COL_SLICE]
-        # Prefer high-confidence whole-name matches (cylinder suffixes first,
-        # then known circle names) before falling back to per-character OCR.
-        gray = cv2.cvtColor(name_crop, cv2.COLOR_RGB2GRAY)
-        best_name, best_score, second_score = _rank_text_candidates(gray, ALL_KNOWN_PART_NAMES, 6, 4)
-        if (
-            best_name is not None and
-            best_score <= 0.60 and
-            (second_score == float("inf") or (second_score - best_score) >= 0.01)
-        ):
-            if best_name in KNOWN_CYLINDER_PART_NAME_SUFFIXES:
-                return best_name
-            normalized = normalize_circle_parts_name(best_name)
-            if normalized is not None and normalized in CIRCLE_PROFILE_BY_NAME:
-                return normalized
-            return best_name
-        raw_name = _sanitize_parts_name(_ocr_parts_name_from_crop(name_crop))
-        if raw_name is not None:
-            normalized_raw_name = "".join(ch for ch in raw_name.upper() if ch.isalnum())
-            if len(normalized_raw_name) >= 6:
-                best_ratio, second_ratio = 0.0, 0.0
-                best_cylinder_name = None
-                for candidate in KNOWN_CYLINDER_PART_NAME_SUFFIXES:
-                    ratio = SequenceMatcher(
-                        None,
-                        normalized_raw_name,
-                        "".join(ch for ch in candidate.upper() if ch.isalnum()),
-                    ).ratio()
-                    if ratio > best_ratio:
-                        second_ratio = best_ratio
-                        best_ratio = ratio
-                        best_cylinder_name = candidate
-                    elif ratio > second_ratio:
-                        second_ratio = ratio
-                if best_ratio >= 0.55 and (best_ratio - second_ratio) >= 0.18:
-                    return best_cylinder_name
-            normalized = normalize_circle_parts_name(raw_name)
-            if normalized is not None and normalized in CIRCLE_PROFILE_BY_NAME:
-                return normalized
-        return raw_name
+        table_layout = get_table_layout(arr)
+        row_y_start = table_layout["row_y_start"]
+        row_height = table_layout["row_height"]
+        row_stride = table_layout["row_stride"]
+        parts_name_slice = table_layout["parts_name_slice"]
+        parts_name_width = table_layout["parts_name_width"]
+        best_name, _, _ = _probe_active_row_parts_name(
+            arr,
+            active_row,
+            row_y_start,
+            row_height,
+            row_stride,
+            parts_name_slice,
+            parts_name_width,
+        )
+        return best_name
     except Exception as e:
         print(f"Parts name OCR failed: {e}")
     return None
@@ -748,6 +1297,10 @@ def compose_session_id(arr, active_row, template_match):
     session_suffix = template_match or ocr_parts_name(arr, active_row)
     if not session_suffix:
         return None
+    if session_suffix not in KNOWN_CYLINDER_PART_NAME_SUFFIXES:
+        resolved_profile = resolve_circle_profile_from_name(session_suffix)
+        if resolved_profile is not None:
+            session_suffix = resolved_profile[0]
     if part_num:
         return f"session_{part_num}_{session_suffix}"
     return f"session_{active_row + 1}_{session_suffix}"
@@ -763,67 +1316,103 @@ def detect_active_feeder_auto_tc(arr, active_row):
     if active_row < 0:
         return None
 
-    y_start_row = TABLE_FIRST_ROW_Y + active_row * TABLE_ROW_STRIDE
-    y_end_row = y_start_row + 29
-    if y_end_row > arr.shape[0] or TABLE_FEEDER_TYPE_COL_SLICE.stop > arr.shape[1]:
+    table_layout = get_table_layout(arr)
+    row_y_start = table_layout["row_y_start"]
+    row_height = table_layout["row_height"]
+    row_stride = table_layout["row_stride"]
+    feeder_slice = table_layout["feeder_slice"]
+    feeder_width = table_layout["feeder_width"]
+    parts_name_slice = table_layout["parts_name_slice"]
+    parts_name_width = table_layout["parts_name_width"]
+
+    def classify_feeder_crop(feeder_gray):
+        for window in (
+            feeder_gray[4:24, :56],
+            feeder_gray[4:24, :64],
+            feeder_gray[2:26, :56],
+            feeder_gray[2:26, 4:68],
+        ):
+            if window.shape[0] < 6 or window.shape[1] < 8:
+                continue
+            matched_label = _match_known_text(
+                window,
+                KNOWN_FEEDER_TYPE_LABELS,
+                max_width_delta=16,
+                max_height_delta=8,
+                max_score=0.50,
+            )
+            if matched_label == "Auto TC":
+                return True
+
+        feeder_template_path = os.path.join(TEMPLATE_DIR, FEEDER_AUTO_TC_TEMPLATE)
+        if not os.path.exists(feeder_template_path):
+            return None
+
+        feeder_mask = np.zeros_like(feeder_gray, dtype=np.uint8)
+        feeder_mask[feeder_gray > 220] = 255
+        feeder_template = np.array(Image.open(feeder_template_path).convert("L"))
+        if feeder_mask.shape != feeder_template.shape:
+            return None
+
+        mask_bbox = _foreground_bbox(feeder_mask)
+        template_bbox = _foreground_bbox(feeder_template)
+        if mask_bbox is None or template_bbox is None:
+            return None
+
+        mx0, my0, mx1, my1 = mask_bbox
+        tx0, ty0, tx1, ty1 = template_bbox
+        if (
+            abs(mx0 - tx0) > 4 or abs(my0 - ty0) > 3 or
+            abs(mx1 - tx1) > 4 or abs(my1 - ty1) > 3
+        ):
+            return None
+
+        template_fg = int(np.count_nonzero(feeder_template))
+        mask_fg = int(np.count_nonzero(feeder_mask))
+        if abs(mask_fg - template_fg) > max(40, int(template_fg * 0.15)):
+            return None
+
+        overlap = int(np.count_nonzero(cv2.bitwise_and(feeder_mask, feeder_template)))
+        if overlap >= int(template_fg * 0.85):
+            return True
+
         return None
 
-    feeder_crop = arr[y_start_row:y_end_row, TABLE_FEEDER_TYPE_COL_SLICE]
-    feeder_gray = cv2.cvtColor(feeder_crop, cv2.COLOR_RGB2GRAY)
+    _, _, preferred_offset = _probe_active_row_parts_name(
+        arr,
+        active_row,
+        row_y_start,
+        row_height,
+        row_stride,
+        parts_name_slice,
+        parts_name_width,
+    )
+    y_offsets = list(_iter_active_row_y_offsets(arr))
+    if preferred_offset in y_offsets:
+        y_offsets.remove(preferred_offset)
+        y_offsets.insert(0, preferred_offset)
 
-    # Score "Auto TC" on multiple feeder text windows so small x-offsets do
-    # not miss the label.
-    for window in (feeder_gray[4:24, :56], feeder_gray[4:24, :64], feeder_gray[2:26, :56]):
-        if window.shape[0] < 6 or window.shape[1] < 8:
+    for y_offset in y_offsets:
+        y_start_row = row_y_start + active_row * row_stride + y_offset
+        y_end_row = y_start_row + row_height
+        if (
+            y_start_row < 0 or
+            y_end_row > arr.shape[0] or
+            feeder_slice.stop > arr.shape[1]
+        ):
             continue
-        matched_label = _match_known_text(
-            window,
-            KNOWN_FEEDER_TYPE_LABELS,
-            max_width_delta=16,
-            max_height_delta=8,
-            max_score=0.50,
+
+        feeder_crop = normalize_text_crop(
+            arr[y_start_row:y_end_row, feeder_slice],
+            feeder_width,
+            29,
         )
-        if matched_label is not None:
-            return matched_label == "Auto TC"
+        feeder_gray = cv2.cvtColor(feeder_crop, cv2.COLOR_RGB2GRAY)
+        feeder_match = classify_feeder_crop(feeder_gray)
+        if feeder_match is True:
+            return True
 
-    feeder_template_path = os.path.join(TEMPLATE_DIR, FEEDER_AUTO_TC_TEMPLATE)
-    if not os.path.exists(feeder_template_path):
-        return None
-
-    feeder_mask = np.zeros_like(feeder_gray, dtype=np.uint8)
-    feeder_mask[feeder_gray > 220] = 255
-    feeder_template = np.array(Image.open(feeder_template_path).convert("L"))
-    if feeder_mask.shape != feeder_template.shape:
-        return None
-
-    # Relaxed template fallback: compare foreground bboxes with small
-    # positional tolerance and foreground overlap instead of near-pixel-perfect
-    # whole-mask comparison.
-    mask_bbox = _foreground_bbox(feeder_mask)
-    template_bbox = _foreground_bbox(feeder_template)
-    if mask_bbox is None or template_bbox is None:
-        # No bright foreground in the feeder cell — uncertain.
-        return None
-
-    mx0, my0, mx1, my1 = mask_bbox
-    tx0, ty0, tx1, ty1 = template_bbox
-    if (
-        abs(mx0 - tx0) > 4 or abs(my0 - ty0) > 3 or
-        abs(mx1 - tx1) > 4 or abs(my1 - ty1) > 3
-    ):
-        # Foreground present but clearly different from "Auto TC" template.
-        return False
-
-    template_fg = int(np.count_nonzero(feeder_template))
-    mask_fg = int(np.count_nonzero(feeder_mask))
-    if abs(mask_fg - template_fg) > max(40, int(template_fg * 0.15)):
-        return False
-
-    overlap = int(np.count_nonzero(cv2.bitwise_and(feeder_mask, feeder_template)))
-    if overlap >= int(template_fg * 0.85):
-        return True
-
-    return False
+    return None
 
 
 def resolve_auto_shape_type(active_row, active_feeder_auto_tc, template_match, active_parts_name=None):
@@ -866,7 +1455,10 @@ def find_crosshair_center(arr):
     # JPEG screenshots often wash out the cyan guide lines. Detect the long
     # horizontal/vertical guide lines by color dominance rather than strict RGB.
     cyan_mask = (g > 120) & (b > 120) & ((g - r) > 20) & ((b - r) > 20)
-    cyan_mask[:, 300:] = False
+    search_limit_x = min(arr.shape[1], scale_frame_x(arr, 300))
+    search_start_y = min(arr.shape[0], scale_frame_y(arr, 200))
+    cyan_mask[:, search_limit_x:] = False
+    cyan_mask[:search_start_y, :] = False
 
     x_hist = cyan_mask.sum(axis=0)
     y_hist = cyan_mask.sum(axis=1)
@@ -874,14 +1466,17 @@ def find_crosshair_center(arr):
         return int(np.argmax(x_hist)), int(np.argmax(y_hist))
 
     y_cyan, x_cyan = np.where((r < 100) & (g > 150) & (b > 150))
-    valid = x_cyan < 300
+    valid = x_cyan < search_limit_x
     x_cyan = x_cyan[valid]
     y_cyan = y_cyan[valid]
+    valid_rows = y_cyan >= search_start_y
+    x_cyan = x_cyan[valid_rows]
+    y_cyan = y_cyan[valid_rows]
     if len(x_cyan) > 50:
         from collections import Counter
         return int(Counter(x_cyan).most_common(1)[0][0]), int(Counter(y_cyan).most_common(1)[0][0])
 
-    return DEFAULT_CROSS_X, DEFAULT_CROSS_Y
+    return scale_frame_x(arr, DEFAULT_CROSS_X), scale_frame_y(arr, DEFAULT_CROSS_Y)
 
 def get_circle_anchor_error(xc, yc, R, xc_cross, yc_cross, anchor_mode=None):
     anchor_points = {
@@ -1070,60 +1665,60 @@ def fit_circle_ransac(
     is_large_target = allowed_ranges is not None and any(high > 150 for low, high in allowed_ranges)
     if is_large_target:
         max_iterations = max(max_iterations, 2000)
-        
+
     num_points = len(x)
     if num_points < 3:
         return None
-    
+
     # Use a fixed seed for determinism
     rng = random.Random(42)
-    
+
     candidates = []
     points = np.column_stack((x, y))
-    
+
     for _ in range(max_iterations):
         # Sample 3 random points
         idx = rng.sample(range(num_points), 3)
         p1, p2, p3 = points[idx[0]], points[idx[1]], points[idx[2]]
-        
+
         circle = circle_from_3_points(p1, p2, p3)
         if circle is None:
             continue
-        
+
         xc, yc, R = circle
         # Filter for circle candidate with radius within strict target ranges
         in_range = any(low <= R <= high for low, high in allowed_ranges)
         if not in_range:
             continue
-            
+
         # Enforce quadrant-based center and boundary constraints for large washer parts
         if R > 120 and center_mode is not None:
             R_final = R + 5.5 if R > 120 else R
             tol = 15.0
             if center_mode == "top":
-                if yc >= yc_cross or abs(yc + R_final - yc_cross) > tol or abs(xc - xc_cross) > tol:
-                    continue
-            elif center_mode == "bottom":
                 if yc <= yc_cross or abs(yc - R_final - yc_cross) > tol or abs(xc - xc_cross) > tol:
                     continue
+            elif center_mode == "bottom":
+                if yc >= yc_cross or abs(yc + R_final - yc_cross) > tol or abs(xc - xc_cross) > tol:
+                    continue
             elif center_mode == "left":
-                if xc >= xc_cross or abs(xc + R_final - xc_cross) > tol or abs(yc - yc_cross) > tol:
+                if xc <= xc_cross or abs(xc - R_final - xc_cross) > tol or abs(yc - yc_cross) > tol:
                     continue
             elif center_mode == "right":
-                if xc <= xc_cross or abs(xc - R_final - xc_cross) > tol or abs(yc - yc_cross) > tol:
+                if xc >= xc_cross or abs(xc + R_final - xc_cross) > tol or abs(yc - yc_cross) > tol:
                     continue
         else:
             # Small parts are taught from one of the fitted circle boundaries.
             # Keep candidates whose geometry can plausibly touch the guide-line center.
             if get_circle_anchor_error(xc, yc, R, xc_cross, yc_cross, anchor_mode=anchor_mode) > 75.0 ** 2:
                 continue
-            
+
         dists = np.abs(np.sqrt((x - xc)**2 + (y - yc)**2) - R)
         inliers = np.where(dists < threshold)[0]
-        
+
         if len(inliers) >= 15:
             candidates.append((len(inliers), (xc, yc, R), inliers))
-            
+
     if not candidates:
         return None
 
@@ -1136,13 +1731,13 @@ def fit_circle_ransac(
         radius_bias = abs(R_c - preferred_radius) if preferred_radius is not None else 0.0
         if R_c > 120 and center_mode is not None:
             if center_mode == "top":
-                return (xc_c - xc_cross)**2 + (yc_c + R_f - yc_cross)**2, radius_bias
-            elif center_mode == "bottom":
                 return (xc_c - xc_cross)**2 + (yc_c - R_f - yc_cross)**2, radius_bias
+            elif center_mode == "bottom":
+                return (xc_c - xc_cross)**2 + (yc_c + R_f - yc_cross)**2, radius_bias
             elif center_mode == "left":
-                return (xc_c + R_f - xc_cross)**2 + (yc_c - yc_cross)**2, radius_bias
-            elif center_mode == "right":
                 return (xc_c - R_f - xc_cross)**2 + (yc_c - yc_cross)**2, radius_bias
+            elif center_mode == "right":
+                return (xc_c + R_f - xc_cross)**2 + (yc_c - yc_cross)**2, radius_bias
         return get_circle_anchor_error(
             xc_c,
             yc_c,
@@ -1244,6 +1839,9 @@ def run_inference(image_b64, shape_type=None):
             None / 'circle' – auto-detect (default circle/RANSAC path).
     """
     try:
+        frame_scale_x = 1.0
+        frame_scale_y = 1.0
+
         def make_no_detect_result(partial_cylinder=False):
             result = {
                 "top": None,
@@ -1255,8 +1853,20 @@ def run_inference(image_b64, shape_type=None):
                 result["_partial_cylinder"] = True
             return result
 
-        def build_session_id():
-            return compose_session_id(arr, active_row, template_match)
+        def build_session_id(session_suffix_override=None):
+            session_suffix = session_suffix_override or template_match or active_parts_name
+            if not session_suffix:
+                return None
+            if session_suffix not in KNOWN_CYLINDER_PART_NAME_SUFFIXES:
+                resolved_profile = resolve_circle_profile_from_name(session_suffix)
+                if resolved_profile is not None:
+                    session_suffix = resolved_profile[0]
+            if session_suffix in {"t0.2*9.0", "t0.2*9"}:
+                session_suffix = "t0.15*9.0"
+            part_num = ocr_part_number(table_arr, active_row)
+            if part_num:
+                return f"session_{part_num}_{session_suffix}"
+            return f"session_{active_row + 1}_{session_suffix}" if active_row != -1 else None
 
         def finalize_result(result, is_cylinder=False):
             if result is None:
@@ -1265,11 +1875,19 @@ def run_inference(image_b64, shape_type=None):
                 result = dict(result)
                 result.pop("_partial_cylinder", None)
             if not is_cylinder and isinstance(result, dict) and "session_id" not in result:
-                session_id = build_session_id()
+                session_suffix_override = None
+                if (
+                    all(result.get(name) is None for name in ("top", "bottom", "left", "right")) and
+                    best_template is not None and
+                    best_template[1] == "template_11_0.png" and
+                    best_template[6] <= 21.0
+                ):
+                    session_suffix_override = "t0.2*11.0"
+                session_id = build_session_id(session_suffix_override)
                 if session_id is not None:
                     result = dict(result)
                     result["session_id"] = session_id
-            return result
+            return scale_detector_result_to_original_frame(result, frame_scale_x, frame_scale_y)
 
         def has_visible_cylinder_points(result):
             if not isinstance(result, dict):
@@ -1282,20 +1900,28 @@ def run_inference(image_b64, shape_type=None):
         # Decode base64 image
         if "base64," in image_b64:
             image_b64 = image_b64.split("base64,")[1]
-        
+
         img_data = base64.b64decode(image_b64)
         img = Image.open(io.BytesIO(img_data)).convert("RGB")
-        arr = np.array(img)
-        
+        if img.size != (1024, 768):
+            return {"error": f"Unsupported image resolution: {img.size}. Expected 1024x768."}
+        original_arr = np.array(img)
+        table_arr = original_arr
+        frame_scale_x = get_frame_scale_x(original_arr)
+        frame_scale_y = get_frame_scale_y(original_arr)
+        arr = normalize_fuji_frame_size(original_arr)
+        layout_scale = get_frame_uniform_scale(arr)
+
         # 1. Dynamically locate the cyan guide-line center
         xc_cross, yc_cross = find_crosshair_center(arr)
-            
+
         # Camera crop box boundaries centered at crosshairs
-        x_start = xc_cross - 127
-        x_end = xc_cross + 127
-        y_start = yc_cross - 127
-        y_end = yc_cross + 127
-        
+        crop_half = scale_frame_len(arr, 127)
+        x_start = xc_cross - crop_half
+        x_end = xc_cross + crop_half
+        y_start = yc_cross - crop_half
+        y_end = yc_cross + crop_half
+
         # Clamp bounds to handle edge of screen safely while keeping crop size 254x254
         if x_start < 0:
             x_end -= x_start
@@ -1309,18 +1935,18 @@ def run_inference(image_b64, shape_type=None):
         if y_end > arr.shape[0]:
             y_start -= (y_end - arr.shape[0])
             y_end = arr.shape[0]
-            
+
         x_start = max(0, x_start)
         y_start = max(0, y_start)
         x_end = min(arr.shape[1], x_end)
         y_end = min(arr.shape[0], y_end)
-            
+
         # Check boundary size
         if (x_end - x_start) < 200 or (y_end - y_start) < 200:
             raise ValueError(f"Image dimensions {arr.shape[:2]} are smaller than camera box")
-            
+
         crop = arr[y_start:y_end, x_start:x_end]
-        
+
         # Check if the corners of the crop are dark (bezel present/M285 machine)
         # We check the average of 4 small corner regions (10x10)
         h, w = crop.shape[:2]
@@ -1330,85 +1956,171 @@ def run_inference(image_b64, shape_type=None):
             np.mean(crop[-10:, :10]) +
             np.mean(crop[-10:, -10:])
         ) / 4.0
-        
+
         template_match = None
         template_ranges = None
         template_nominal = None
         template_kind = None
         active_feeder_auto_tc = None
         active_parts_name = None
-        
-        # Determine active row by comparing average brightness of the three row zones.
-        # The selected row is always significantly darker than the unselected rows.
+        best_template = None
+
+        # Prefer the visible "*" marker in the No. column when present;
+        # otherwise fall back to the gray selection background heuristic.
+        table_layout = get_table_layout(table_arr)
+        row_y_start = table_layout["row_y_start"]
+        row_height = table_layout["row_height"]
+        row_stride = table_layout["row_stride"]
+        parts_name_slice = table_layout["parts_name_slice"]
+        parts_name_width = table_layout["parts_name_width"]
+        no_col_slice = table_layout["no_col_slice"]
+        no_col_width = table_layout["no_col_width"]
+        row_probe_left = 360
+        row_probe_right = 620
         row_averages = []
+        row_midtone_scores = []
+        row_medians = []
+        row_selection_deltas = []
+        marker_rows = []
         for idx in range(TABLE_VISIBLE_ROWS):
-            y_start_row = TABLE_FIRST_ROW_Y + idx * TABLE_ROW_STRIDE
-            y_end_row = y_start_row + 29
-            if y_end_row <= arr.shape[0]:
-                row_slice = arr[y_start_row:y_end_row, 50:350]
-                row_averages.append(np.mean(row_slice))
+            y_start_row = row_y_start + idx * row_stride
+            y_end_row = y_start_row + row_height
+            if y_end_row <= table_arr.shape[0]:
+                row_slice = table_arr[y_start_row:y_end_row, row_probe_left:row_probe_right]
+                row_gray = np.mean(row_slice, axis=2)
+                row_mean = float(np.mean(row_gray))
+                row_median = float(np.median(row_gray))
+                row_averages.append(row_mean)
+                row_medians.append(row_median)
+                row_midtone_scores.append(float(np.mean((row_gray >= 165.0) & (row_gray <= 225.0))))
+                row_selection_deltas.append(abs(row_median - 194.0))
+                marker_crop = normalize_text_crop(
+                    table_arr[y_start_row:y_end_row, no_col_slice],
+                    no_col_width,
+                    29,
+                )
+                marker_rows.append(_has_selected_row_marker(marker_crop))
             else:
                 row_averages.append(255.0)
-                
+                row_medians.append(255.0)
+                row_midtone_scores.append(0.0)
+                row_selection_deltas.append(float("inf"))
+                marker_rows.append(False)
+
         active_row = -1
-        if row_averages:
-            min_idx = int(np.argmin(row_averages))
-            if row_averages[min_idx] < 210:  # Active row must have gray/dark selection background
-                active_row = min_idx
-                    
+        if layout_scale >= 1.15:
+            if row_averages:
+                best_idx = min(
+                    range(len(row_selection_deltas)),
+                    key=lambda idx: (row_selection_deltas[idx], -row_midtone_scores[idx], row_averages[idx]),
+                )
+                if row_selection_deltas[best_idx] <= 28.0 and row_midtone_scores[best_idx] >= 0.04:
+                    active_row = best_idx
+                else:
+                    min_idx = int(np.argmin(row_averages))
+                    if row_averages[min_idx] < 210:
+                        active_row = min_idx
+            if active_row == -1 and marker_rows.count(True) == 1:
+                active_row = marker_rows.index(True)
+        else:
+            if marker_rows.count(True) == 1:
+                active_row = marker_rows.index(True)
+            elif row_averages:
+                best_idx = min(
+                    range(len(row_selection_deltas)),
+                    key=lambda idx: (row_selection_deltas[idx], -row_midtone_scores[idx], row_averages[idx]),
+                )
+                if row_selection_deltas[best_idx] <= 28.0 and row_midtone_scores[best_idx] >= 0.04:
+                    active_row = best_idx
+                else:
+                    min_idx = int(np.argmin(row_averages))
+                    if row_averages[min_idx] < 210:
+                        active_row = min_idx
         if active_row != -1:
-            y_start_row = TABLE_FIRST_ROW_Y + active_row * TABLE_ROW_STRIDE
-            y_end_row = y_start_row + 29
-            if y_end_row <= arr.shape[0] and 205 <= arr.shape[1]:
-                crop_rgb = arr[y_start_row:y_end_row, TABLE_PARTS_NAME_COL_SLICE]
+            y_start_row = row_y_start + active_row * row_stride
+            y_end_row = y_start_row + row_height
+            if y_end_row <= table_arr.shape[0] and parts_name_slice.stop <= table_arr.shape[1]:
+                # Normalize the selected-row parts-name crop back to the base
+                # template size so the fixed row templates still match scaled
+                # screenshots such as 1024x768 captures.
+                crop_rgb = normalize_text_crop(
+                    table_arr[y_start_row:y_end_row, parts_name_slice],
+                    parts_name_width,
+                    29,
+                )
                 crop_gray = np.mean(crop_rgb, axis=2)
                 mask_active = (crop_gray > 220).astype(np.uint8) * 255
-                active_parts_name = ocr_parts_name(arr, active_row)
-                parts_name_profile = resolve_circle_profile_from_name(active_parts_name)
-                if parts_name_profile is not None:
-                    template_match, template_ranges, template_nominal, template_kind = parts_name_profile
-                else:
-                    best_match = None
-                    best_template = None
-                    best_match_diff = float("inf")
-                    min_diff = float("inf")
-                    template_configs = [
-                        ("t0.2*11.0", "template_11_0.png", [(200, 320)], 240, "large", 3.0),
-                        ("t0.3*2.0", "template_2_0.png", [(45, 60)], 54, "small", 15.0),
-                        ("t0.15*10", "template_10.png", [(20, 35)], 28, "small", 15.0),
-                    ]
+                best_match = None
+                best_template = None
+                template_configs = [
+                    ("t0.2*11.0", "template_11_0.png", [(200, 320)], 240, "large", 3.0),
+                    ("t0.15*9.0", None, [(65, 90)], 75, "medium", 18.0),
+                    ("t0.3*2.0", "template_2_0.png", [(45, 60)], 54, "small", 15.0),
+                ]
 
-                    for part_name, filename, ranges, r_nom, kind, max_diff in template_configs:
+                for part_name, filename, ranges, r_nom, kind, max_diff in template_configs:
+                    if filename is None:
+                        template_arr = _render_parts_name_mask(part_name, (mask_active.shape[1], mask_active.shape[0]), 0, 0)
+                    else:
                         template_path = os.path.join(TEMPLATE_DIR, filename)
-                        if os.path.exists(template_path):
-                            template_img = Image.open(template_path).convert("L")
-                            template_arr = np.array(template_img)
-                            if mask_active.shape == template_arr.shape:
-                                diff = np.mean(np.abs(mask_active.astype(float) - template_arr.astype(float)))
-                                if diff < min_diff:
-                                    min_diff = diff
-                                    best_template = (part_name, filename, ranges, r_nom, kind, max_diff, diff)
-                                if diff < best_match_diff and diff <= max_diff:
-                                    best_match_diff = diff
-                                    best_match = (part_name, ranges, r_nom, kind)
+                        if not os.path.exists(template_path):
+                            continue
+                        template_img = Image.open(template_path).convert("L")
+                        template_arr = np.array(template_img)
 
-                    if best_match:
-                        template_match, template_ranges, template_nominal, template_kind = best_match
-                    elif best_template is not None and best_template[1] == "template_11_0.png" and best_template[6] <= 16.0:
-                        template_match = "t0.15*9.0"
-                        template_ranges = [(65, 90)]
-                        template_nominal = 75
-                        template_kind = "medium"
+                    if mask_active.shape == template_arr.shape:
+                        diff, match_score = score_parts_name_template_match(mask_active, template_arr)
+                        if best_template is None or match_score < best_template[7]:
+                            best_template = (part_name, filename, ranges, r_nom, kind, max_diff, diff, match_score)
+                        if diff <= max_diff and (best_match is None or match_score < best_match[5]):
+                            best_match = (part_name, ranges, r_nom, kind, diff, match_score)
 
-            active_feeder_auto_tc = detect_active_feeder_auto_tc(arr, active_row)
+                best_9mm_name, best_9mm_score, second_9mm_score = _rank_text_candidates(
+                    crop_gray,
+                    ("t0.15*9.0", "t0.15*9", "t0.2*9.0", "t0.2*9"),
+                    8,
+                    5,
+                )
+                best_10mm_name, best_10mm_score, second_10mm_score = _rank_text_candidates(
+                    crop_gray,
+                    ("t0.15*10", "t0.15*10.0", "t0.2*10", "t0.2*10.0"),
+                    8,
+                    5,
+                )
+                fallback_profile = resolve_circle_profile_fallback(
+                    best_template,
+                    best_10mm_name,
+                    best_10mm_score,
+                    second_10mm_score,
+                    best_9mm_name,
+                    best_9mm_score,
+                    second_9mm_score,
+                )
+                active_parts_name = ocr_parts_name(table_arr, active_row)
+                parts_name_profile = resolve_circle_profile_with_template_override(active_parts_name, best_template)
+                if (
+                    parts_name_profile is not None and
+                    parts_name_profile[3] == "medium" and
+                    best_match is not None and
+                    best_match[3] == "small"
+                ):
+                    template_match, template_ranges, template_nominal, template_kind, _, _ = best_match
+                elif parts_name_profile is not None:
+                    template_match, template_ranges, template_nominal, template_kind = parts_name_profile
+                elif fallback_profile is not None:
+                    template_match, template_ranges, template_nominal, template_kind = fallback_profile
+                elif best_match:
+                    template_match, template_ranges, template_nominal, template_kind, _, _ = best_match
+
+            active_feeder_auto_tc = detect_active_feeder_auto_tc(table_arr, active_row)
             if active_parts_name in KNOWN_CYLINDER_PART_NAME_SUFFIXES:
                 active_feeder_auto_tc = False
-        
+
         # Filter pixels
         r = crop[:, :, 0].astype(float)
         g = crop[:, :, 1].astype(float)
         b = crop[:, :, 2].astype(float)
-        
+
         mean_val = (r + g + b) / 3.0
         is_gray = (np.abs(r - g) < 15) & (np.abs(g - b) < 15) & (np.abs(r - b) < 15)
 
@@ -2032,9 +2744,12 @@ def run_inference(image_b64, shape_type=None):
             bottom_q_mean = np.mean(crop_gray_q[cy_q:, :])
             left_q_mean = np.mean(crop_gray_q[:, :cx_q])
             right_q_mean = np.mean(crop_gray_q[:, cx_q:])
-            q_means = [top_q_mean, bottom_q_mean, left_q_mean, right_q_mean]
-            q_modes = ["top", "bottom", "left", "right"]
-            large_center_mode = q_modes[np.argmin(q_means)]
+            large_center_mode = resolve_large_center_mode_from_quadrants(
+                top_q_mean,
+                bottom_q_mean,
+                left_q_mean,
+                right_q_mean,
+            )
 
             # Detect active teaching mode for small circles based on SMT UI label text.
             cyan_pixels = (
@@ -2043,15 +2758,17 @@ def run_inference(image_b64, shape_type=None):
                 ((crop[:, :, 1].astype(int) - crop[:, :, 0].astype(int)) > 20) &
                 ((crop[:, :, 2].astype(int) - crop[:, :, 0].astype(int)) > 20)
             )
-            top_region = cyan_pixels[20:100, 110:144].copy()
-            bottom_region = cyan_pixels[154:234, 110:144].copy()
-            left_region = cyan_pixels[110:144, 20:100].copy()
-            right_region = cyan_pixels[110:144, 154:234].copy()
+            crop_scale = crop.shape[0] / 254.0
+            crop_px = lambda value: max(0, int(round(value * crop_scale)))
+            top_region = cyan_pixels[crop_px(20):crop_px(100), crop_px(110):crop_px(144)].copy()
+            bottom_region = cyan_pixels[crop_px(154):crop_px(234), crop_px(110):crop_px(144)].copy()
+            left_region = cyan_pixels[crop_px(110):crop_px(144), crop_px(20):crop_px(100)].copy()
+            right_region = cyan_pixels[crop_px(110):crop_px(144), crop_px(154):crop_px(234)].copy()
 
-            top_region[:, 12:22] = False
-            bottom_region[:, 12:22] = False
-            left_region[12:22, :] = False
-            right_region[12:22, :] = False
+            top_region[:, crop_px(12):crop_px(22)] = False
+            bottom_region[:, crop_px(12):crop_px(22)] = False
+            left_region[crop_px(12):crop_px(22), :] = False
+            right_region[crop_px(12):crop_px(22), :] = False
 
             overlay_counts = {
                 "top": int(np.count_nonzero(top_region)),
@@ -2085,17 +2802,31 @@ def run_inference(image_b64, shape_type=None):
             else:
                 small_anchor_mode = None
 
-            small_search_ranges = template_ranges if template_kind in ("small", "medium") else [(20, 65)]
-            small_nominal = template_nominal if template_kind in ("small", "medium") else None
-            large_search_ranges = template_ranges if template_kind == "large" else [(200, 320)]
-            large_nominal = template_nominal if template_kind == "large" else 240
+            resolved_circle_profile = resolve_circle_profile_from_name(template_match or active_parts_name)
+            resolved_profile_name = resolved_circle_profile[0] if resolved_circle_profile is not None else None
+            use_unscaled_small_profile = layout_scale >= 1.15 and resolved_profile_name == "t0.3*2.0"
+            small_search_ranges = (
+                template_ranges if use_unscaled_small_profile
+                else scale_radius_ranges(template_ranges, layout_scale)
+            ) if template_kind in ("small", "medium") else scale_radius_ranges([(20, 65)], layout_scale)
+            small_nominal = (
+                template_nominal if use_unscaled_small_profile else (template_nominal * layout_scale)
+            ) if template_kind in ("small", "medium") and template_nominal is not None else None
+            medium_search_ranges = scale_radius_ranges([(65, 90)], layout_scale)
+            medium_nominal = 75 * layout_scale
+            large_search_ranges = (
+                scale_radius_ranges(template_ranges, layout_scale)
+                if template_kind == "large"
+                else scale_radius_ranges([(200, 320)], layout_scale)
+            )
+            large_nominal = (template_nominal * layout_scale) if template_kind == "large" and template_nominal is not None else (240 * layout_scale)
 
             # Circular camera window mask: only consider pixels within the camera
             # window (radius ~120 pixels, centered at 127, 127 in the crop). Pixels
             # outside the camera window (e.g., the Executing dialog) are excluded
             # from detection.
-            cy_center, cx_center = 127, 127
-            camera_radius = 120
+            cy_center, cx_center = crop.shape[0] // 2, crop.shape[1] // 2
+            camera_radius = crop_px(120)
             yy, xx = np.ogrid[:crop.shape[0], :crop.shape[1]]
             camera_mask = (xx - cx_center) ** 2 + (yy - cy_center) ** 2 <= camera_radius ** 2
             masked_mean = np.where(camera_mask, mean_val, crop_mean)
@@ -2130,10 +2861,10 @@ def run_inference(image_b64, shape_type=None):
             # Executing dialog mask: the dialog is always in the upper-right
             # portion of the screen. Set those pixels to background to
             # prevent false edges from interfering with RANSAC.
-            DIALOG_Y_LO = 80
-            DIALOG_Y_HI = 220
-            DIALOG_X_LO = 170
-            DIALOG_X_HI = 254
+            DIALOG_Y_LO = crop_px(80)
+            DIALOG_Y_HI = crop_px(220)
+            DIALOG_X_LO = crop_px(170)
+            DIALOG_X_HI = crop.shape[1]
 
             # Mask out any UI pixels (which are colored/saturated) and their black outlines/shadows.
             # Real camera pixels are grayscale (R, G, B channels are very close).
@@ -2143,7 +2874,7 @@ def run_inference(image_b64, shape_type=None):
             is_ui = (np.maximum(np.maximum(r_crop, g_crop), b_crop) - np.minimum(np.minimum(r_crop, g_crop), b_crop)) > 20
             dialog_region = is_ui[DIALOG_Y_LO:DIALOG_Y_HI, DIALOG_X_LO:DIALOG_X_HI]
             dialog_present = np.count_nonzero(dialog_region) > 800
-            
+
             if dialog_present:
                 DIALOG_X_LO = 142
 
@@ -2154,11 +2885,11 @@ def run_inference(image_b64, shape_type=None):
             )
             if dialog_present or not preserve_faint_upper_right_target:
                 masked_mean[DIALOG_Y_LO:DIALOG_Y_HI, DIALOG_X_LO:DIALOG_X_HI] = crop_mean
-            
+
             # Dilate the UI mask by 6 pixels to completely cover the black borders/outlines of the UI
             kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (13, 13))
             dilated_ui = cv2.dilate(is_ui.astype(np.uint8), kernel).astype(bool)
-                    
+
             masked_mean[dilated_ui] = crop_mean
 
             is_not_cyan = ~is_ui
@@ -2314,6 +3045,38 @@ def run_inference(image_b64, shape_type=None):
                     ):
                         resolved_pixels["top"] = raw_pixels["top"]
 
+                if (
+                    R < 120 and
+                    resolved_pixels["bottom"] is None and
+                    resolved_pixels["top"] is not None and
+                    resolved_pixels["left"] is not None and
+                    resolved_pixels["right"] is not None
+                ):
+                    bottom_x, bottom_y = raw_pixels["bottom"]
+                    bottom_local_x = int(round(bottom_x - x_start))
+                    bottom_local_y = int(round(bottom_y - y_start))
+                    if (
+                        0 <= bottom_local_x < crop.shape[1] and
+                        0 <= bottom_local_y < crop.shape[0]
+                    ):
+                        resolved_pixels["bottom"] = raw_pixels["bottom"]
+
+                if R < 120:
+                    visible_names = tuple(
+                        name for name in ("top", "bottom", "left", "right")
+                        if resolved_pixels[name] is not None
+                    )
+                    if len(visible_names) == 3:
+                        for missing_name in ("top", "bottom", "left", "right"):
+                            if resolved_pixels[missing_name] is not None:
+                                continue
+                            raw_x, raw_y = raw_pixels[missing_name]
+                            local_x = int(round(raw_x - x_start))
+                            local_y = int(round(raw_y - y_start))
+                            if 0 <= local_x < crop.shape[1] and 0 <= local_y < crop.shape[0]:
+                                resolved_pixels[missing_name] = raw_pixels[missing_name]
+                            break
+
                 centered_vertical_support = (
                     resolved_pixels["top"] is not None and
                     resolved_pixels["bottom"] is not None and
@@ -2338,17 +3101,97 @@ def run_inference(image_b64, shape_type=None):
                     ):
                         resolved_pixels["left"] = raw_pixels["left"]
 
+                if (
+                    resolved_pixels["bottom"] is None and
+                    resolved_pixels["top"] is not None and
+                    resolved_pixels["left"] is not None and
+                    resolved_pixels["right"] is not None and
+                    R < 120
+                ):
+                    bottom_x, bottom_y = raw_pixels["bottom"]
+                    bottom_local_x = int(round(bottom_x - x_start))
+                    bottom_local_y = int(round(bottom_y - y_start))
+                    if (
+                        0 <= bottom_local_x < crop.shape[1] and
+                        0 <= bottom_local_y < crop.shape[0]
+                    ):
+                        resolved_pixels["bottom"] = raw_pixels["bottom"]
+
                 return resolved_pixels
+
+            def count_visible_circle_points(candidate):
+                if candidate is None:
+                    return -1
+                circle_fit = candidate.get("circle")
+                if circle_fit is None:
+                    return -1
+                visible_pixels = resolve_circle_pixel_visibility(
+                    circle_fit[0],
+                    circle_fit[1],
+                    circle_fit[2],
+                    candidate.get("support_x"),
+                    candidate.get("support_y"),
+                )
+                return sum(
+                    1
+                    for name in ("top", "bottom", "left", "right")
+                    if visible_pixels[name] is not None
+                )
+
+            def choose_medium_circle_candidate(refined_candidate, hough_candidate):
+                if hough_candidate is None:
+                    return refined_candidate
+                if refined_candidate is None:
+                    return hough_candidate
+
+                refined_visible_count = count_visible_circle_points(refined_candidate)
+                hough_visible_count = count_visible_circle_points(hough_candidate)
+                if refined_visible_count > hough_visible_count:
+                    return refined_candidate
+                if hough_visible_count > refined_visible_count:
+                    return hough_candidate
+                return choose_candidate(refined_candidate, hough_candidate)
+
+            def should_prefer_unprofiled_medium_candidate(small_candidate, medium_candidate):
+                if medium_candidate is None:
+                    return False
+                if active_row == -1 or active_feeder_auto_tc is not True:
+                    return False
+
+                medium_circle = medium_candidate.get("circle")
+                if medium_circle is None or medium_circle[2] < 80.0:
+                    return False
+
+                medium_visible_count = count_visible_circle_points(medium_candidate)
+                if medium_visible_count < 3:
+                    return False
+
+                if small_candidate is None:
+                    return True
+
+                small_circle = small_candidate.get("circle")
+                if small_circle is None:
+                    return True
+                if resolve_circle_profile_from_name(
+                    infer_circle_session_suffix(template_match, active_parts_name, small_circle[2])
+                ) is not None:
+                    return False
+
+                if medium_circle[2] < small_circle[2] + 18.0:
+                    return False
+
+                small_visible_count = count_visible_circle_points(small_candidate)
+                return medium_visible_count >= small_visible_count
 
             def get_large_alignment_error(xc, yc, R):
                 R_final = R + 5.5 if R > 120 else R
                 if large_center_mode == "top":
-                    return (xc - xc_cross) ** 2 + (yc + R_final - yc_cross) ** 2
-                if large_center_mode == "bottom":
                     return (xc - xc_cross) ** 2 + (yc - R_final - yc_cross) ** 2
+                if large_center_mode == "bottom":
+                    return (xc - xc_cross) ** 2 + (yc + R_final - yc_cross) ** 2
                 if large_center_mode == "left":
-                    return (xc + R_final - xc_cross) ** 2 + (yc - yc_cross) ** 2
-                return (xc - R_final - xc_cross) ** 2 + (yc - yc_cross) ** 2
+                    return (xc - R_final - xc_cross) ** 2 + (yc - yc_cross) ** 2
+                return (xc + R_final - xc_cross) ** 2 + (yc - yc_cross) ** 2
 
             def choose_candidate(best_candidate, candidate):
                 if candidate is None:
@@ -2356,6 +3199,270 @@ def run_inference(image_b64, shape_type=None):
                 if best_candidate is None or candidate["sort_key"] < best_candidate["sort_key"]:
                     return candidate
                 return best_candidate
+
+            def choose_small_circle_candidate(edge_candidate, opencv_candidate):
+                if opencv_candidate is None:
+                    return edge_candidate
+                if edge_candidate is None:
+                    return opencv_candidate
+
+                if template_kind == "small" and (small_nominal is None or small_nominal >= 45.0):
+                    edge_circle = edge_candidate.get("circle")
+                    opencv_circle = opencv_candidate.get("circle")
+                    if edge_circle is not None and opencv_circle is not None:
+                        edge_x, edge_y, edge_r = edge_circle
+                        opencv_x, opencv_y, opencv_r = opencv_circle
+                        center_gap = float(np.hypot(edge_x - opencv_x, edge_y - opencv_y))
+                        radius_gain = edge_r - opencv_r
+                        if (
+                            center_gap <= max(10.0, max(edge_r, opencv_r) * 0.18) and
+                            radius_gain >= max(8.0, max(edge_r, opencv_r) * 0.12)
+                        ):
+                            edge_metrics = edge_candidate.get("metrics") or {}
+                            opencv_metrics = opencv_candidate.get("metrics") or {}
+                            if (
+                                edge_metrics.get("cardinal_support", 0) + 1 >= opencv_metrics.get("cardinal_support", 0) and
+                                edge_metrics.get("coverage_bins", 0) + 2 >= opencv_metrics.get("coverage_bins", 0) and
+                                edge_metrics.get("residual_mean", float("inf")) <= opencv_metrics.get("residual_mean", float("inf")) + 1.2 and
+                                edge_metrics.get("residual_p90", float("inf")) <= opencv_metrics.get("residual_p90", float("inf")) + 1.5
+                            ):
+                                return edge_candidate
+
+                resolved_small_profile = resolve_circle_profile_from_name(template_match or active_parts_name)
+                if (
+                    layout_scale >= 1.15 and
+                    resolved_small_profile is not None and
+                    resolved_small_profile[0] == "t0.3*2.0"
+                ):
+                    edge_circle = edge_candidate.get("circle")
+                    opencv_circle = opencv_candidate.get("circle")
+                    if edge_circle is not None and opencv_circle is not None:
+                        edge_modes = infer_small_anchor_modes(edge_candidate.get("support_x"), edge_candidate.get("support_y"))
+                        opencv_modes = infer_small_anchor_modes(opencv_candidate.get("support_x"), opencv_candidate.get("support_y"))
+                        if not edge_modes:
+                            edge_modes = [None]
+                        if not opencv_modes:
+                            opencv_modes = [None]
+
+                        def best_anchor_error(circle_fit, anchor_modes):
+                            xc_fit, yc_fit, radius_fit = circle_fit
+                            return min(
+                                get_circle_anchor_error(
+                                    xc_fit,
+                                    yc_fit,
+                                    radius_fit,
+                                    xc_cross,
+                                    yc_cross,
+                                    anchor_mode=mode,
+                                )
+                                for mode in anchor_modes
+                            )
+
+                        edge_anchor_error = best_anchor_error(edge_circle, edge_modes)
+                        opencv_anchor_error = best_anchor_error(opencv_circle, opencv_modes)
+                        edge_metrics = edge_candidate.get("metrics") or {}
+                        opencv_metrics = opencv_candidate.get("metrics") or {}
+                        if (
+                            edge_anchor_error + (8.0 ** 2) < opencv_anchor_error and
+                            edge_metrics.get("residual_mean", float("inf")) <= opencv_metrics.get("residual_mean", float("inf")) + 0.8 and
+                            edge_metrics.get("residual_p90", float("inf")) <= opencv_metrics.get("residual_p90", float("inf")) + 1.0
+                        ):
+                            return edge_candidate
+
+                return opencv_candidate
+
+            def refine_small_outer_ring_candidate(candidate):
+                if candidate is None or layout_scale < 1.15:
+                    return candidate
+                resolved_small_profile = resolve_circle_profile_from_name(template_match or active_parts_name)
+                profile_name = resolved_small_profile[0] if resolved_small_profile is not None else None
+                active_auto_tc_medium_probe = template_kind is None and active_row != -1 and active_feeder_auto_tc is True
+                if profile_name == "t0.3*2.0":
+                    return candidate
+                if template_kind == "medium" or template_kind == "large":
+                    return candidate
+                if candidate["circle"][2] > 65.0:
+                    return candidate
+                if small_nominal is not None and small_nominal < 45.0 and profile_name != "t0.3*2.0":
+                    return candidate
+
+                xc_fit, yc_fit, R_fit = candidate["circle"]
+
+                current_profile = get_medium_ring_evidence_profile(xc_fit, yc_fit, R_fit)
+                current_visible = resolve_circle_pixel_visibility(
+                    xc_fit,
+                    yc_fit,
+                    R_fit,
+                    candidate["support_x"],
+                    candidate["support_y"],
+                )
+                current_visible_count = sum(
+                    1 for name in ("top", "bottom", "left", "right")
+                    if current_visible[name] is not None
+                )
+                search_high = max(high for _, high in small_search_ranges)
+                if active_auto_tc_medium_probe:
+                    search_high = max(search_high, max(high for _, high in medium_search_ranges))
+                if current_visible_count >= 4 and R_fit >= 45.0:
+                    search_high = max(search_high, 90.0)
+                if search_high <= R_fit + 6.0:
+                    return candidate
+                inferred_modes = infer_small_anchor_modes(candidate["support_x"], candidate["support_y"])
+                if not inferred_modes:
+                    inferred_modes = [None]
+
+                def best_anchor_error_for_radius(radius_value):
+                    return min(
+                        get_circle_anchor_error(
+                            xc_fit,
+                            yc_fit,
+                            float(radius_value),
+                            xc_cross,
+                            yc_cross,
+                            anchor_mode=mode,
+                        )
+                        for mode in inferred_modes
+                    )
+
+                current_anchor_error = best_anchor_error_for_radius(R_fit)
+                preferred_nominal = (
+                    medium_nominal if active_auto_tc_medium_probe
+                    else (small_nominal if small_nominal is not None else R_fit)
+                )
+                best_radius = float(R_fit)
+                best_key = (
+                    current_profile["dark_cardinals"],
+                    current_profile["dark_bins"],
+                    current_profile["mean_strength"],
+                    -current_anchor_error,
+                    -abs(float(R_fit) - preferred_nominal),
+                    -float(R_fit),
+                )
+
+                if active_auto_tc_medium_probe:
+                    search_low = max(R_fit + 6.0, preferred_nominal - 22.0)
+                    search_stop = float(search_high)
+                elif current_visible_count >= 4 and R_fit >= 45.0:
+                    search_low = max(R_fit + 6.0, 65.0)
+                    search_stop = float(search_high)
+                else:
+                    search_low = max(R_fit + 6.0, preferred_nominal - 14.0)
+                    search_stop = min(float(search_high), preferred_nominal + 14.0)
+                if search_stop <= search_low:
+                    search_low = R_fit + 6.0
+                    search_stop = float(search_high)
+
+                for trial_radius in np.arange(search_low, search_stop + 0.1, 1.0):
+                    trial_profile = get_medium_ring_evidence_profile(xc_fit, yc_fit, float(trial_radius))
+                    if trial_profile["visible_bins"] < 10:
+                        continue
+
+                    improves_ring = (
+                        trial_profile["dark_cardinals"] >= current_profile["dark_cardinals"] + 1 or
+                        trial_profile["dark_bins"] >= current_profile["dark_bins"] + 4 or
+                        trial_profile["mean_strength"] >= current_profile["mean_strength"] + 2.0
+                    )
+                    if not improves_ring:
+                        continue
+
+                    trial_visible = resolve_circle_pixel_visibility(
+                        xc_fit,
+                        yc_fit,
+                        float(trial_radius),
+                        candidate["support_x"],
+                        candidate["support_y"],
+                    )
+                    trial_visible_count = sum(
+                        1 for name in ("top", "bottom", "left", "right")
+                        if trial_visible[name] is not None
+                    )
+                    if trial_visible_count < current_visible_count:
+                        continue
+                    trial_anchor_error = best_anchor_error_for_radius(trial_radius)
+                    if trial_anchor_error > current_anchor_error + (8.0 ** 2):
+                        continue
+
+                    trial_key = (
+                        trial_profile["dark_cardinals"],
+                        trial_profile["dark_bins"],
+                        trial_profile["mean_strength"],
+                        -trial_anchor_error,
+                        -abs(float(trial_radius) - preferred_nominal),
+                        -float(trial_radius),
+                    )
+                    if trial_key > best_key:
+                        best_key = trial_key
+                        best_radius = float(trial_radius)
+
+                if best_radius <= R_fit + 4.0:
+                    local_xc = xc_fit - x_start
+                    local_yc = yc_fit - y_start
+                    valid_sample_mask = camera_mask & (~dilated_ui)
+                    sample_radius = 3
+                    darkness_margin = max(5.0, min(12.0, crop_std * 0.45 + 2.0))
+
+                    def sample_patch_mean(px, py):
+                        x_c = int(round(px))
+                        y_c = int(round(py))
+                        x0 = max(0, x_c - sample_radius)
+                        x1 = min(mean_val.shape[1], x_c + sample_radius + 1)
+                        y0 = max(0, y_c - sample_radius)
+                        y1 = min(mean_val.shape[0], y_c + sample_radius + 1)
+                        if x0 >= x1 or y0 >= y1:
+                            return None
+                        patch_mask = valid_sample_mask[y0:y1, x0:x1]
+                        if np.count_nonzero(patch_mask) < 4:
+                            return None
+                        return float(np.mean(mean_val[y0:y1, x0:x1][patch_mask]))
+
+                    probe_radii = []
+                    probe_start = int(round(max(R_fit + 6.0, search_low)))
+                    probe_stop = int(round(search_stop))
+                    for dx, dy in ((0.0, -1.0), (0.0, 1.0), (-1.0, 0.0), (1.0, 0.0)):
+                        best_probe = None
+                        for trial_radius in range(probe_start, probe_stop + 1):
+                            inner_mean = sample_patch_mean(
+                                local_xc + dx * max(1.0, trial_radius - 5.0),
+                                local_yc + dy * max(1.0, trial_radius - 5.0),
+                            )
+                            ring_mean = sample_patch_mean(
+                                local_xc + dx * trial_radius,
+                                local_yc + dy * trial_radius,
+                            )
+                            outer_mean = sample_patch_mean(
+                                local_xc + dx * (trial_radius + 5.0),
+                                local_yc + dy * (trial_radius + 5.0),
+                            )
+                            if inner_mean is None or ring_mean is None or outer_mean is None:
+                                continue
+                            score = (0.5 * (inner_mean + outer_mean)) - ring_mean
+                            if score < darkness_margin:
+                                continue
+                            probe_key = (score, -abs(float(trial_radius) - preferred_nominal), float(trial_radius))
+                            if best_probe is None or probe_key > best_probe[0]:
+                                best_probe = (probe_key, float(trial_radius))
+                        if best_probe is not None:
+                            probe_radii.append(best_probe[1])
+
+                    if len(probe_radii) >= 3:
+                        median_probe_radius = float(np.median(probe_radii))
+                        probe_anchor_error = best_anchor_error_for_radius(median_probe_radius)
+                        if (
+                            median_probe_radius > R_fit + 6.0 and
+                            probe_anchor_error <= current_anchor_error + (8.0 ** 2)
+                        ):
+                            best_radius = median_probe_radius
+                        else:
+                            return candidate
+                    else:
+                        return candidate
+
+                refined_candidate = dict(candidate)
+                refined_candidate["circle"] = (xc_fit, yc_fit, best_radius)
+                return refined_candidate
+
+            def refine_small_crosshair_candidate(candidate):
+                return candidate
 
             def get_medium_visibility_profile(xc_fit, yc_fit, R_fit):
                 total_bins = 24
@@ -2602,13 +3709,51 @@ def run_inference(image_b64, shape_type=None):
                 medium_visibility_profile = get_medium_visibility_profile(xc_fit, yc_fit, R_fit) if template_kind == "medium" else None
 
                 if target_kind == "small":
+                    inferred_small_profile = infer_circle_session_suffix(template_match, active_parts_name, R_fit)
                     bright_faint_mode = template_kind == "small" and crop_p5 >= 230.0 and crop_std < 18.0
                     center_teaching_mode = (
                         template_kind == "small" and
                         center_object_present and
                         center_distance <= max(12.0, R_fit * 0.25)
                     )
-                    if not medium_mode and not bright_faint_mode and not center_teaching_mode and circumference_error > max(18.0, R_fit * 0.4):
+                    inferred_modes = infer_small_anchor_modes(support_x, support_y)
+                    if inferred_modes:
+                        anchor_error = min(
+                            get_circle_anchor_error(
+                                xc_fit,
+                                yc_fit,
+                                R_fit,
+                                xc_cross,
+                                yc_cross,
+                                anchor_mode=anchor_mode,
+                            )
+                            for anchor_mode in inferred_modes
+                        )
+                    else:
+                        anchor_error = get_circle_anchor_error(
+                            xc_fit,
+                            yc_fit,
+                            R_fit,
+                            xc_cross,
+                            yc_cross,
+                            anchor_mode=None,
+                        )
+                    off_crosshair_circle_mode = (
+                        layout_scale >= 1.15 and
+                        active_row != -1 and
+                        active_feeder_auto_tc is True and
+                        boundary_margin >= 0.0 and
+                        metrics["coverage_bins"] >= 10 and
+                        metrics["cardinal_support"] >= 3 and
+                        center_distance >= max(32.0, R_fit * 0.55)
+                    )
+                    if (
+                        not medium_mode and
+                        not bright_faint_mode and
+                        not center_teaching_mode and
+                        not off_crosshair_circle_mode and
+                        circumference_error > max(18.0, R_fit * 0.4)
+                    ):
                         return None
                     if bright_faint_mode:
                         coverage_ok = 0 if metrics["coverage_bins"] >= 4 else 1
@@ -2631,6 +3776,20 @@ def run_inference(image_b64, shape_type=None):
                             metrics["residual_mean"],
                             -metrics["support_count"],
                             circumference_error,
+                        )
+                    elif off_crosshair_circle_mode:
+                        sort_key = (
+                            0,
+                            radius_bias,
+                            metrics["residual_mean"],
+                            metrics["residual_p90"],
+                            -R_fit,
+                            -metrics["cardinal_support"],
+                            -metrics["coverage_bins"],
+                            max(0.0, -boundary_margin),
+                            metrics["largest_gap_bins"],
+                            -metrics["support_count"],
+                            center_distance,
                         )
                     elif medium_mode:
                         if not is_valid_medium_candidate(metrics, medium_visibility_profile, medium_ring_profile):
@@ -2679,10 +3838,16 @@ def run_inference(image_b64, shape_type=None):
                 }
 
             def detect_medium_hough_circle_candidate():
-                if template_kind != "medium":
+                relaxed_active_auto_tc = template_kind != "medium" and active_row != -1 and active_feeder_auto_tc is True
+                if template_kind == "medium":
+                    search_ranges = small_search_ranges
+                    nominal_radius = small_nominal
+                elif active_row != -1 and active_feeder_auto_tc is True:
+                    search_ranges = medium_search_ranges
+                    nominal_radius = medium_nominal
+                else:
                     return None
 
-                search_ranges = small_search_ranges
                 min_radius = int(max(1, min(low for low, _ in search_ranges)))
                 max_radius = int(max(high for _, high in search_ranges))
                 valid_mask = camera_mask & is_gray_local & is_not_cyan & (~dilated_ui)
@@ -2744,16 +3909,21 @@ def run_inference(image_b64, shape_type=None):
                             radius_seed,
                             tolerance=max(4.0, min(9.0, radius_seed * 0.12)),
                         )
-                        if metrics["support_count"] < 120:
+                        min_support = 70 if dialog_present else (90 if relaxed_active_auto_tc else 120)
+                        min_coverage = 10 if dialog_present else (14 if relaxed_active_auto_tc else 16)
+                        min_cardinals = 2 if dialog_present else (2 if relaxed_active_auto_tc else 3)
+                        max_residual_mean = 5.4 if dialog_present else (5.2 if relaxed_active_auto_tc else 4.5)
+                        max_residual_p90 = 9.2 if dialog_present else (9.0 if relaxed_active_auto_tc else 8.0)
+                        if metrics["support_count"] < min_support:
                             continue
-                        if metrics["coverage_bins"] < 16:
+                        if metrics["coverage_bins"] < min_coverage:
                             continue
-                        if metrics["cardinal_support"] < 3:
+                        if metrics["cardinal_support"] < min_cardinals:
                             continue
-                        if metrics["residual_mean"] > 4.5 or metrics["residual_p90"] > 8.0:
+                        if metrics["residual_mean"] > max_residual_mean or metrics["residual_p90"] > max_residual_p90:
                             continue
 
-                        radius_bias = abs(radius_seed - small_nominal) if small_nominal is not None else 0.0
+                        radius_bias = abs(radius_seed - nominal_radius) if nominal_radius is not None else 0.0
                         key = (
                             radius_bias,
                             metrics["residual_mean"],
@@ -2776,6 +3946,167 @@ def run_inference(image_b64, shape_type=None):
 
                     if best_candidate is not None:
                         return best_candidate
+
+                return best_candidate
+
+            def detect_offset_small_hough_candidate():
+                if not (layout_scale >= 1.15 and active_row != -1 and active_feeder_auto_tc is True and active_parts_name is None):
+                    return None
+
+                valid_mask = camera_mask & is_gray_local & is_not_cyan & (~dilated_ui)
+                if np.count_nonzero(valid_mask) < 1000:
+                    return None
+
+                gray_raw = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
+                fill_value = int(np.median(gray_raw[valid_mask]))
+                work = gray_raw.copy()
+                work[~valid_mask] = fill_value
+                blur = cv2.medianBlur(work, 5)
+
+                edge_mask_hough = cv2.Canny(blur, 35, 100)
+                edge_mask_hough[~valid_mask] = 0
+                edge_y, edge_x = np.where(edge_mask_hough > 0)
+                if len(edge_x) < 50:
+                    return None
+
+                edge_x_full = edge_x.astype(float) + x_start
+                edge_y_full = edge_y.astype(float) + y_start
+                best_candidate = None
+                best_key = None
+
+                for param2 in (18, 16, 14, 20):
+                    circles = cv2.HoughCircles(
+                        blur,
+                        cv2.HOUGH_GRADIENT,
+                        dp=1.1,
+                        minDist=40,
+                        param1=80,
+                        param2=param2,
+                        minRadius=40,
+                        maxRadius=70,
+                    )
+                    if circles is None:
+                        continue
+
+                    for cx_local, cy_local, radius_seed in circles[0][:10]:
+                        cx_seed = float(cx_local + x_start)
+                        cy_seed = float(cy_local + y_start)
+                        radius_seed = float(radius_seed)
+
+                        residuals = np.abs(
+                            np.sqrt((edge_x_full - cx_seed) ** 2 + (edge_y_full - cy_seed) ** 2) - radius_seed
+                        )
+                        support_mask = residuals <= max(4.0, radius_seed * 0.10)
+                        if np.count_nonzero(support_mask) < 20:
+                            continue
+
+                        support_x = edge_x_full[support_mask]
+                        support_y = edge_y_full[support_mask]
+                        metrics = get_circle_support_metrics(
+                            support_x,
+                            support_y,
+                            cx_seed,
+                            cy_seed,
+                            radius_seed,
+                            tolerance=max(4.0, min(8.0, radius_seed * 0.12)),
+                        )
+                        center_distance = float(np.hypot(cx_seed - xc_cross, cy_seed - yc_cross))
+                        if center_distance < max(40.0, radius_seed * 0.65):
+                            continue
+                        if metrics["support_count"] < 40 or metrics["coverage_bins"] < 8 or metrics["cardinal_support"] < 2:
+                            continue
+                        if metrics["residual_mean"] > 5.0 or metrics["residual_p90"] > 9.0:
+                            continue
+
+                        key = (
+                            0 if metrics["cardinal_support"] >= 4 else 1,
+                            -metrics["coverage_bins"],
+                            metrics["residual_mean"],
+                            metrics["residual_p90"],
+                            center_distance,
+                            -radius_seed,
+                            -metrics["support_count"],
+                            param2,
+                        )
+                        if best_key is None or key < best_key:
+                            best_key = key
+                            best_candidate = {
+                                "circle": (cx_seed, cy_seed, radius_seed),
+                                "support_x": support_x,
+                                "support_y": support_y,
+                                "metrics": metrics,
+                                "sort_key": key,
+                                "source": "offset_small_hough",
+                            }
+
+                    if best_candidate is not None:
+                        return best_candidate
+
+                return best_candidate
+
+            def detect_crosshair_small_hough_candidate():
+                if active_row == -1 or active_feeder_auto_tc is not True:
+                    return None
+                if template_kind != "small":
+                    return None
+
+                nominal_radius = small_nominal if small_nominal is not None else 54.0
+                ring_tone_threshold = crop_mean - max(8.0, crop_std * 0.35)
+                best_candidate = None
+                best_key = None
+                local_xc = xc_cross - x_start
+                local_yc = yc_cross - y_start
+
+                for low, high in small_search_ranges:
+                    for trial_radius in np.arange(float(low), float(high) + 0.1, 1.0):
+                        ring_error = np.abs(np.sqrt((xx - local_xc) ** 2 + (yy - local_yc) ** 2) - trial_radius)
+                        ring_band_mask = (
+                            camera_mask &
+                            is_gray_local &
+                            is_not_cyan &
+                            (~dilated_ui) &
+                            (ring_error <= max(4.0, min(8.0, trial_radius * 0.10))) &
+                            ((mean_val <= ring_tone_threshold) | contrast_edge_mask)
+                        )
+                        y_band, x_band = np.where(ring_band_mask)
+                        if len(x_band) < 20:
+                            continue
+
+                        x_band_full = x_band.astype(float) + x_start
+                        y_band_full = y_band.astype(float) + y_start
+                        metrics = get_circle_support_metrics(
+                            x_band_full,
+                            y_band_full,
+                            float(xc_cross),
+                            float(yc_cross),
+                            float(trial_radius),
+                            tolerance=max(4.0, min(8.0, trial_radius * 0.12)),
+                        )
+                        if metrics["support_count"] < 20 or metrics["coverage_bins"] < 6:
+                            continue
+                        if metrics["residual_mean"] > 5.5 or metrics["residual_p90"] > 9.5:
+                            continue
+
+                        candidate = {
+                            "circle": (float(xc_cross), float(yc_cross), float(trial_radius)),
+                            "support_x": x_band_full,
+                            "support_y": y_band_full,
+                            "metrics": metrics,
+                            "source": "crosshair_small_hough",
+                        }
+                        visible_count = count_visible_circle_points(candidate)
+                        key = (
+                            0 if visible_count >= 3 else 1,
+                            abs(float(trial_radius) - nominal_radius),
+                            metrics["residual_mean"],
+                            metrics["residual_p90"],
+                            -metrics["cardinal_support"],
+                            -metrics["coverage_bins"],
+                            -metrics["support_count"],
+                        )
+                        if best_key is None or key < best_key:
+                            best_key = key
+                            best_candidate = candidate
 
                 return best_candidate
 
@@ -3258,6 +4589,7 @@ def run_inference(image_b64, shape_type=None):
                 metrics = get_circle_support_metrics(support_x, support_y, xc_fit, yc_fit, R_fit)
                 radius_bias = abs(R_fit - nominal_radius) if nominal_radius is not None else 0.0
                 if target_kind == "small":
+                    inferred_small_profile = infer_circle_session_suffix(template_match, active_parts_name, R_fit)
                     medium_mode = template_kind == "medium"
                     boundary_margin = min(
                         xc_fit - R_fit - x_start,
@@ -3304,6 +4636,15 @@ def run_inference(image_b64, shape_type=None):
                         return None
                     if not medium_mode and anchor_error > 80.0 ** 2:
                         return None
+                    off_crosshair_circle_mode = (
+                        layout_scale >= 1.15 and
+                        active_row != -1 and
+                        active_feeder_auto_tc is True and
+                        boundary_margin >= 0.0 and
+                        metrics["coverage_bins"] >= 10 and
+                        metrics["cardinal_support"] >= 3 and
+                        center_distance >= max(32.0, R_fit * 0.55)
+                    )
                     medium_visibility_profile = get_medium_visibility_profile(xc_fit, yc_fit, R_fit) if medium_mode else None
                     medium_ring_profile = get_medium_ring_evidence_profile(xc_fit, yc_fit, R_fit) if medium_mode else None
                     if medium_mode:
@@ -3326,6 +4667,12 @@ def run_inference(image_b64, shape_type=None):
                                 return None
                             if sector_ratio > 0.52:
                                 return None
+                        if (
+                            not bright_edge_mode and
+                            not off_crosshair_circle_mode and
+                            circumference_error > max(18.0, R_fit * 0.4)
+                        ):
+                            return None
                     boundary_penalty = max(0.0, 8.0 - boundary_margin)
                     if medium_mode:
                         sort_key = get_medium_outer_ring_sort_key(
@@ -3367,6 +4714,20 @@ def run_inference(image_b64, shape_type=None):
                             anchor_error,
                             max(0.0, -boundary_margin),
                             sector_ratio,
+                        )
+                    elif off_crosshair_circle_mode:
+                        sort_key = (
+                            0,
+                            radius_bias,
+                            metrics["residual_mean"],
+                            metrics["residual_p90"],
+                            -R_fit,
+                            -metrics["cardinal_support"],
+                            -metrics["coverage_bins"],
+                            max(0.0, -boundary_margin),
+                            metrics["largest_gap_bins"],
+                            -metrics["support_count"],
+                            center_distance,
                         )
                     else:
                         interior_priority = 0 if boundary_margin >= 8.0 else 1
@@ -3719,26 +5080,20 @@ def run_inference(image_b64, shape_type=None):
                     return np.array([], dtype=int), np.array([], dtype=int)
                 return np.concatenate(x_parts), np.concatenate(y_parts)
 
-            def has_large_washer_evidence(edge_mask):
-                band = 18
-                central_slice = slice(60, 194)
-                side_scores = [
-                    int(np.count_nonzero(edge_mask[:band, central_slice])),
-                    int(np.count_nonzero(edge_mask[-band:, central_slice])),
-                    int(np.count_nonzero(edge_mask[central_slice, :band])),
-                    int(np.count_nonzero(edge_mask[central_slice, -band:])),
-                ]
-                return max(side_scores) >= 45
-
             best_small_candidate = None
             best_large_candidate = None
             best_opencv_small_candidate = None
             best_medium_hough_candidate = None
+            best_offset_small_candidate = None
+            best_crosshair_small_candidate = None
+            prefer_large_without_profile = False
 
             if template_kind != "large":
                 best_opencv_small_candidate = detect_opencv_circle_candidate("small")
-            if template_kind == "medium":
+            if template_kind == "medium" or (active_row != -1 and active_feeder_auto_tc is True):
                 best_medium_hough_candidate = detect_medium_hough_circle_candidate()
+            best_offset_small_candidate = detect_offset_small_hough_candidate()
+            best_crosshair_small_candidate = detect_crosshair_small_hough_candidate()
 
             if template_kind != "large" and small_anchor_mode is None:
                 contrast_components = extract_connected_components(contrast_edge_mask, min_pixels=6)
@@ -3823,6 +5178,9 @@ def run_inference(image_b64, shape_type=None):
                 if len(x_indices) < 50:
                     continue
 
+                if has_large_washer_evidence(edge_mask):
+                    prefer_large_without_profile = True
+
                 x_idx_full = x_indices + x_start
                 y_idx_full = y_indices + y_start
 
@@ -3856,7 +5214,7 @@ def run_inference(image_b64, shape_type=None):
                             build_circle_candidate(small_circle, x_small, y_small, small_nominal, "small"),
                         )
 
-                if template_kind == "large":
+                if template_kind == "large" or prefer_large_without_profile:
                     large_candidate = evaluate_component_candidates(
                         edge_components,
                         large_search_ranges,
@@ -3913,7 +5271,7 @@ def run_inference(image_b64, shape_type=None):
                                 build_circle_candidate(arc_circle, x_arc_fit, y_arc_fit, large_nominal, "large"),
                             )
 
-            if template_kind == "large":
+            if template_kind == "large" or prefer_large_without_profile:
                 best_candidate = best_large_candidate if best_large_candidate is not None else best_small_candidate
             else:
                 if template_kind == "medium":
@@ -3930,19 +5288,99 @@ def run_inference(image_b64, shape_type=None):
                         refined_medium_candidate = refine_medium_axis_geometry(best_candidate)
                         if refined_medium_candidate is not None:
                             best_candidate = refined_medium_candidate
-                        if best_medium_hough_candidate is not None:
-                            best_candidate = best_medium_hough_candidate
+                        best_candidate = choose_medium_circle_candidate(
+                            best_candidate,
+                            best_medium_hough_candidate,
+                        )
                 elif best_opencv_small_candidate is not None:
-                    best_candidate = best_opencv_small_candidate
+                    best_candidate = choose_small_circle_candidate(
+                        best_small_candidate,
+                        best_opencv_small_candidate,
+                    )
                 else:
                     best_candidate = best_small_candidate if best_small_candidate is not None else best_large_candidate
+                if should_prefer_unprofiled_medium_candidate(best_candidate, best_medium_hough_candidate):
+                    best_candidate = best_medium_hough_candidate
+                if best_offset_small_candidate is not None:
+                    if best_candidate is None or count_visible_circle_points(best_offset_small_candidate) >= count_visible_circle_points(best_candidate):
+                        best_candidate = best_offset_small_candidate
+                if best_crosshair_small_candidate is not None:
+                    current_profile_name = None if best_candidate is None else infer_circle_session_suffix(
+                        template_match,
+                        active_parts_name,
+                        best_candidate["circle"][2],
+                    )
+                    if (
+                        best_candidate is None or
+                        (
+                            current_profile_name == "t0.3*2.0" and
+                            count_visible_circle_points(best_crosshair_small_candidate) >= 3
+                        )
+                    ):
+                        best_candidate = best_crosshair_small_candidate
+                best_candidate = refine_small_outer_ring_candidate(best_candidate)
+                best_candidate = refine_small_crosshair_candidate(best_candidate)
 
             if best_candidate is None:
                 return None
 
-            session_id = build_session_id()
+            if best_candidate is not None and active_row != -1 and active_feeder_auto_tc is True:
+                inferred_small_profile = infer_circle_session_suffix(
+                    template_match,
+                    active_parts_name,
+                    best_candidate["circle"][2],
+                )
+                if inferred_small_profile == "t0.3*2.0":
+                    nominal_radius = small_nominal if small_nominal is not None else 54.0
+                    local_xc = xc_cross - x_start
+                    local_yc = yc_cross - y_start
+                    ring_tone_threshold = crop_mean - max(8.0, crop_std * 0.35)
+                    ring_error = np.abs(np.sqrt((xx - local_xc) ** 2 + (yy - local_yc) ** 2) - float(nominal_radius))
+                    ring_band_mask = (
+                        camera_mask &
+                        is_gray_local &
+                        is_not_cyan &
+                        (~dilated_ui) &
+                        (ring_error <= max(4.0, min(8.0, nominal_radius * 0.10))) &
+                        ((mean_val <= ring_tone_threshold) | contrast_edge_mask)
+                    )
+                    y_band, x_band = np.where(ring_band_mask)
+                    if len(x_band) >= 200:
+                        x_band_full = x_band.astype(float) + x_start
+                        y_band_full = y_band.astype(float) + y_start
+                        centered_metrics = get_circle_support_metrics(
+                            x_band_full,
+                            y_band_full,
+                            float(xc_cross),
+                            float(yc_cross),
+                            float(nominal_radius),
+                            tolerance=max(4.0, min(8.0, nominal_radius * 0.12)),
+                        )
+                        center_distance = float(
+                            np.hypot(best_candidate["circle"][0] - xc_cross, best_candidate["circle"][1] - yc_cross)
+                        )
+                        if (
+                            centered_metrics["coverage_bins"] >= 20 and
+                            centered_metrics["cardinal_support"] >= 4 and
+                            center_distance > max(18.0, nominal_radius * 0.25)
+                        ):
+                            best_candidate = {
+                                "circle": (float(xc_cross), float(yc_cross), float(nominal_radius)),
+                                "support_x": x_band_full,
+                                "support_y": y_band_full,
+                                "metrics": centered_metrics,
+                                "sort_key": best_candidate.get("sort_key"),
+                            }
 
             xc, yc, R = best_candidate["circle"]
+
+            # Prefer the suffix that is consistent with the fitted circle
+            # radius. Weak row-name OCR or template matches can guess the wrong
+            # family, but the circle fit is already available here.
+            inferred_suffix = infer_circle_session_suffix(template_match, active_parts_name, R)
+            session_id = build_session_id(inferred_suffix)
+            if session_id is None:
+                session_id = build_session_id()
 
             if R > 120:
                 R += 5.5
@@ -3975,13 +5413,9 @@ def run_inference(image_b64, shape_type=None):
                 name for name in ("top", "bottom", "left", "right")
                 if visible_pixels[name] is not None
             )
-            if (
-                shape_type != "circle" and
-                template_kind == "small" and
-                visible_names in (("right",), ("bottom",), ("bottom", "right"))
-            ):
+            if should_reject_partial_small_circle(shape_type, template_kind, visible_names):
                 return None
-                
+
             res = {
                 "top": visible_pixels["top"],
                 "bottom": visible_pixels["bottom"],
@@ -3989,7 +5423,7 @@ def run_inference(image_b64, shape_type=None):
                 "right": visible_pixels["right"],
                 "session_id": session_id,
             }
-            return res
+            return finalize_result(res)
 
         # 3. Mode Routing Control Flow
         if shape_type == "cylinder":
@@ -4012,18 +5446,24 @@ def run_inference(image_b64, shape_type=None):
                     cyl_res = detect_cylinder()
                     if isinstance(cyl_res, dict) and cyl_res.get("left") is not None and cyl_res.get("right") is not None:
                         return finalize_result(cyl_res, is_cylinder=True)
+                if active_row != -1:
+                    shape_type = "circle"
+                    circle_res = detect_circle()
+                    if circle_res is not None:
+                        return circle_res
                 # No active row in the parts table — we have no template context,
                 # so we cannot reliably distinguish real parts from background.
                 # Return no-detection to prevent false positives.
-                return make_no_detect_result()
+                return finalize_result(make_no_detect_result())
             if auto_shape_type == "circle":
+                shape_type = "circle"
                 circle_res = detect_circle()
                 if circle_res is not None:
                     return circle_res
                 cyl_res = detect_cylinder()
                 if has_visible_cylinder_points(cyl_res):
                     return finalize_result(cyl_res, is_cylinder=True)
-                return make_no_detect_result()
+                return finalize_result(make_no_detect_result())
             if auto_shape_type == "cylinder":
                 cyl_res = detect_cylinder()
                 if has_visible_cylinder_points(cyl_res):
@@ -4033,11 +5473,11 @@ def run_inference(image_b64, shape_type=None):
                 circle_res = detect_circle()
                 if circle_res is not None:
                     return circle_res
-                return make_no_detect_result()
-            
+                return finalize_result(make_no_detect_result())
+
         # Fallback return when nothing succeeded
-        return make_no_detect_result()
-            
+        return finalize_result(make_no_detect_result())
+
     except Exception as e:
         # If any preprocessing or decoding exception occurs, return it in the error response format
         return {"error": f"Failed to process image: {str(e)}"}
