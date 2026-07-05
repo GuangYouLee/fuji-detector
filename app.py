@@ -126,6 +126,7 @@ def _run_image_detection(data, requested_edge=None):
 
 
 @app.route("/api/v1/process_image", methods=["POST"])
+@app.route("/api/v1/detect_screen", methods=["POST"])
 def process_image():
     """
     Main inference endpoint. Matches training_type (e.g. FUJI_DETECTOR)
@@ -135,50 +136,26 @@ def process_image():
 
 
 @app.route("/api/v1/top", methods=["POST"])
+@app.route("/api/v1/detect_screen/top", methods=["POST"])
 def process_image_top():
     return _run_image_detection(_request_data(), requested_edge="top")
 
 
 @app.route("/api/v1/bottom", methods=["POST"])
+@app.route("/api/v1/detect_screen/bottom", methods=["POST"])
 def process_image_bottom():
     return _run_image_detection(_request_data(), requested_edge="bottom")
 
 
 @app.route("/api/v1/left", methods=["POST"])
+@app.route("/api/v1/detect_screen/left", methods=["POST"])
 def process_image_left():
     return _run_image_detection(_request_data(), requested_edge="left")
 
 
 @app.route("/api/v1/right", methods=["POST"])
-def process_image_right():
-    return _run_image_detection(_request_data(), requested_edge="right")
-
-
-@app.route("/api/v1/detect_screen", methods=["POST"])
-def detect_screen():
-    """
-    Runs the shared image inference path using the posted base64 image.
-    """
-    return _run_image_detection(_request_data())
-
-
-@app.route("/api/v1/detect_screen/top", methods=["POST"])
-def detect_screen_top():
-    return _run_image_detection(_request_data(), requested_edge="top")
-
-
-@app.route("/api/v1/detect_screen/bottom", methods=["POST"])
-def detect_screen_bottom():
-    return _run_image_detection(_request_data(), requested_edge="bottom")
-
-
-@app.route("/api/v1/detect_screen/left", methods=["POST"])
-def detect_screen_left():
-    return _run_image_detection(_request_data(), requested_edge="left")
-
-
 @app.route("/api/v1/detect_screen/right", methods=["POST"])
-def detect_screen_right():
+def process_image_right():
     return _run_image_detection(_request_data(), requested_edge="right")
 
 

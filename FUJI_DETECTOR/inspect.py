@@ -308,18 +308,21 @@ def _digit_templates():
             templates[digit] = arr_d[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
     return templates
 
-
-def _match_digit(char_img):
-    best_digit = None
+def _match_char_against_templates(char_img, templates):
+    best_char = None
     min_diff = float("inf")
     h_c, w_c = char_img.shape
-    for digit, temp in _digit_templates().items():
+    for char, temp in templates.items():
         temp_resized = cv2.resize(temp, (w_c, h_c), interpolation=cv2.INTER_NEAREST)
         diff = float(np.mean(cv2.absdiff(char_img, temp_resized))) / 255.0
         if diff < min_diff:
             min_diff = diff
-            best_digit = digit
-    return best_digit, min_diff
+            best_char = char
+    return best_char, min_diff
+
+
+def _match_digit(char_img):
+    return _match_char_against_templates(char_img, _digit_templates())
 
 
 @lru_cache(maxsize=1)
@@ -342,16 +345,7 @@ def _parts_name_templates():
 
 
 def _match_parts_name_char(char_img):
-    best_char = None
-    min_diff = float("inf")
-    h_c, w_c = char_img.shape
-    for char, temp in _parts_name_templates().items():
-        temp_resized = cv2.resize(temp, (w_c, h_c), interpolation=cv2.INTER_NEAREST)
-        diff = float(np.mean(cv2.absdiff(char_img, temp_resized))) / 255.0
-        if diff < min_diff:
-            min_diff = diff
-            best_char = char
-    return best_char, min_diff
+    return _match_char_against_templates(char_img, _parts_name_templates())
 
 
 def _render_parts_name_mask(text, size, x_offset, y_offset):
@@ -760,7 +754,7 @@ def _classify_single_digit_token(token):
     return None
 
 
-def _read_active_row_part_number(no_crop):
+def _extract_focus_boxes_and_thresh(no_crop):
     gray = cv2.cvtColor(no_crop, cv2.COLOR_RGB2GRAY)
     focus = gray[2:18, 64:77]
     _, thresh = cv2.threshold(focus, 205, 255, cv2.THRESH_BINARY)
@@ -774,7 +768,11 @@ def _read_active_row_part_number(no_crop):
         if y == 0 and h_c <= 2:
             continue
         boxes.append((x, y, w_c, h_c, area))
+    return thresh, boxes
 
+
+def _read_active_row_part_number(no_crop):
+    thresh, boxes = _extract_focus_boxes_and_thresh(no_crop)
     if not boxes:
         return None
 
@@ -811,20 +809,7 @@ def _read_active_row_part_number(no_crop):
 
 
 def _has_selected_row_marker(no_crop):
-    gray = cv2.cvtColor(no_crop, cv2.COLOR_RGB2GRAY)
-    focus = gray[2:18, 64:77]
-    _, thresh = cv2.threshold(focus, 205, 255, cv2.THRESH_BINARY)
-    num_labels, _, stats, _ = cv2.connectedComponentsWithStats(thresh, 8)
-
-    boxes = []
-    for idx in range(1, num_labels):
-        x, y, w_c, h_c, area = stats[idx]
-        if area < 2:
-            continue
-        if y == 0 and h_c <= 2:
-            continue
-        boxes.append((x, y, w_c, h_c, area))
-
+    _, boxes = _extract_focus_boxes_and_thresh(no_crop)
     if len(boxes) < 2:
         return False
 
@@ -1287,24 +1272,6 @@ def ocr_parts_name(arr, active_row):
     except Exception as e:
         print(f"Parts name OCR failed: {e}")
     return None
-
-
-def compose_session_id(arr, active_row, template_match):
-    if active_row == -1:
-        return None
-
-    part_num = ocr_part_number(arr, active_row)
-    session_suffix = template_match or ocr_parts_name(arr, active_row)
-    if not session_suffix:
-        return None
-    if session_suffix not in KNOWN_CYLINDER_PART_NAME_SUFFIXES:
-        resolved_profile = resolve_circle_profile_from_name(session_suffix)
-        if resolved_profile is not None:
-            session_suffix = resolved_profile[0]
-    if part_num:
-        return f"session_{part_num}_{session_suffix}"
-    return f"session_{active_row + 1}_{session_suffix}"
-
 
 def detect_active_feeder_auto_tc(arr, active_row):
     """Tri-state detector for the "Auto TC" feeder label on the active row.
