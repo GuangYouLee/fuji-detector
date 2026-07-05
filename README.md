@@ -188,7 +188,7 @@ Returned when processing circular components (e.g., washers). All detected bound
 ```
 
 ### Scenario B: Cylinder Pattern Detection
-Returned when processing cylindrical components. Outputs the fitted `center`, the `left` and `right` edge boundaries, and sets circular geometry bounds to `null`.
+Returned when processing cylindrical components. Outputs the fitted `center`, the `left` and `right` edge boundaries, sets circular geometry bounds to `null`, and includes the detected `session_id`.
 
 **Request payload:**
 ```json
@@ -208,7 +208,8 @@ Returned when processing cylindrical components. Outputs the fitted `center`, th
     "left": [48, 404],
     "right": [222, 301],
     "center": [138, 352],
-    "radius": null
+    "radius": null,
+    "session_id": "session_9_KG3B_35_5F4Z"
   }
 }
 ```

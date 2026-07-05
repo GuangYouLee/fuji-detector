@@ -36,6 +36,14 @@ def _request_data(default_training_type=None):
     )
     if training_type is not None:
         data["training_type"] = training_type
+
+    shape_type = (
+        request.args.get("SHAPE_TYPE")
+        or request.args.get("shape_type")
+        or data.get("shape_type")
+    )
+    if shape_type is not None:
+        data["shape_type"] = shape_type
     return data
 
 
