@@ -3,6 +3,7 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from FUJI_DETECTOR.inspect import run_inference as _run_fuji_inference
 
+
 app = Flask(__name__)
 app.json.sort_keys = False
 CORS(app)
@@ -18,12 +19,12 @@ _seq_cache: dict = {}
 
 def _success(data, status=200):
     """Return JSON response for success cases."""
-    return jsonify({"data": data, "success": True}), status
+    return jsonify({"data": data}), status
 
 
 def _error(message, status=400):
     """Return JSON response for error cases."""
-    return jsonify({"data": {"message": message}, "success": False}), status
+    return jsonify({"data": {"message": message}}), status
 
 
 def _request_data(default_training_type=None):
@@ -241,7 +242,7 @@ def detect_screen_next():
 def clear_sessions():
     """Clear all accumulated session data (including sequential cache slots)."""
     _seq_cache.clear()
-    return jsonify({"success": True})
+    return jsonify({"data": {"message": "Sessions cleared"}})
 
 
 if __name__ == "__main__":
