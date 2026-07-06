@@ -110,6 +110,7 @@ Main inference endpoint. Matches `training_type` and routes base64 encoded image
 **Response (Success - Circle)**
 ```json
 {
+  "status": "success",
   "data": {
     "top": [139, 341],
     "bottom": null,
@@ -136,6 +137,7 @@ Top-edge endpoint. It uses the posted base64 image from the JSON payload and rea
 Returns the selected edge in the compact response schema:
 ```json
 {
+  "status": "success",
   "data": {
     "execute_label": "Top",
     "session_id": "session_2_t0.2*11.0",
@@ -150,6 +152,7 @@ Clears all accumulated session data for large circle alignment.
 **Response**
 ```json
 {
+  "status": "success",
   "data": {
     "message": "Sessions cleared"
   }
@@ -176,6 +179,7 @@ Returned when processing circular components (e.g., washers). All detected bound
 **Response payload:**
 ```json
 {
+  "status": "success",
   "data": {
     "top": [148, 251],
     "bottom": [148, 359],
@@ -200,6 +204,7 @@ Returned when processing cylindrical components. Outputs the fitted `center`, th
 **Response payload:**
 ```json
 {
+  "status": "success",
   "data": {
     "top": null,
     "bottom": null,
@@ -226,6 +231,7 @@ Returned when no active pattern is detected in the capture (e.g., empty backgrou
 **Response payload:**
 ```json
 {
+  "status": "success",
   "data": {
     "top": null,
     "bottom": null,
