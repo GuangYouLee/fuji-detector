@@ -1,4 +1,7 @@
+import os
+import json
 import uuid
+import redis
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from FUJI_DETECTOR.inspect import run_inference as _run_fuji_inference
@@ -12,9 +15,54 @@ POINT_FIELDS = ("top", "bottom", "left", "right")
 
 # ---------------------------------------------------------------------------
 # Sequential session cache — used by /detect_screen/next
-# Key: session_id (str)  Value: {"edges": [...remaining labels...], "result": dict}
 # ---------------------------------------------------------------------------
-_seq_cache: dict = {}
+REDIS_HOST = os.environ.get("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.environ.get("REDIS_PORT", 6379))
+
+try:
+    _redis_client = redis.Redis(
+        host=REDIS_HOST,
+        port=REDIS_PORT,
+        db=0,
+        decode_responses=True,
+        socket_connect_timeout=1.0,
+        socket_timeout=1.0
+    )
+    _redis_client.ping()
+    _use_redis = True
+    print(f"Connected to Redis at {REDIS_HOST}:{REDIS_PORT}")
+except Exception as e:
+    _use_redis = False
+    _seq_cache: dict = {}
+    print(f"Redis not available ({e}). Falling back to in-memory session cache.")
+
+
+def _cache_get(key):
+    if _use_redis:
+        val = _redis_client.get(key)
+        return json.loads(val) if val else None
+    return _seq_cache.get(key)
+
+
+def _cache_set(key, val, ex=3600):
+    if _use_redis:
+        _redis_client.set(key, json.dumps(val), ex=ex)
+    else:
+        _seq_cache[key] = val
+
+
+def _cache_delete(key):
+    if _use_redis:
+        _redis_client.delete(key)
+    elif key in _seq_cache:
+        del _seq_cache[key]
+
+
+def _cache_clear():
+    if _use_redis:
+        _redis_client.flushdb()
+    else:
+        _seq_cache.clear()
 
 
 def _success(data, status=200):
@@ -24,7 +72,14 @@ def _success(data, status=200):
 
 def _error(message, status=400):
     """Return JSON response for error cases."""
-    return jsonify({"status": "failed", "data": {"message": message}}), status
+    return jsonify({
+        "status": "failed",
+        "data": {
+            "message": message,
+            "execute": "none",
+            "execute_label": "none"
+        }
+    }), status
 
 
 def _request_data(default_training_type=None):
@@ -45,6 +100,15 @@ def _request_data(default_training_type=None):
     )
     if shape_type is not None:
         data["shape_type"] = shape_type
+
+    session_id = (
+        request.args.get("SESSION_ID")
+        or request.args.get("session_id")
+        or data.get("session_id")
+    )
+    if session_id is not None:
+        data["session_id"] = session_id
+
     return data
 
 
@@ -65,12 +129,14 @@ def _run_detection(data):
 
         result = _run_fuji_inference(image_b64, shape_type=data.get("shape_type"))
     except ValueError as e:
-        return None, _error(str(e))
+        return None, (str(e), 400)
     except Exception as e:
-        return None, _error(f"Inference failed: {e}", status=500)
+        return None, (f"Inference failed: {e}", 500)
 
     if isinstance(result, dict) and "error" in result:
-        return None, _error(result["error"])
+        if "Unsupported image resolution" in result["error"]:
+            return {}, None
+        return None, (result["error"], 400)
 
     return result, None
 
@@ -115,25 +181,181 @@ def _format_all_edges(result):
     }
 
 
-def _run_image_detection(data, requested_edge=None):
+def _resume_cached_session(session_id):
+    slot = _cache_get(session_id)
+    if not slot:
+        return None
+
+    remaining_labels = slot["edges"]
+    result = slot["result"]
+
+    if not remaining_labels:
+        _cache_delete(session_id)
+        return result, None, [], "pass"
+
+    popped_label = remaining_labels.pop(0)
+    remaining_after_pop = list(remaining_labels)
+
+    if remaining_labels:
+        _cache_set(session_id, slot)
+        remaining_status = "continue"
+    else:
+        _cache_delete(session_id)
+        remaining_status = "pass"
+
+    return result, popped_label, remaining_after_pop, remaining_status
+
+
+def _start_cached_session(result):
+    detected = [label for label in POINT_FIELDS if result.get(label) is not None]
+    if not detected:
+        return None
+
+    model_session_id = result.get("session_id")
+    detector_session_id = model_session_id or str(uuid.uuid4())
+    popped_label = detected.pop(0)
+
+    if detected:
+        _cache_set(detector_session_id, {"edges": detected, "result": result})
+
+    return detector_session_id, popped_label, detected
+
+
+def _format_option_b_response(result, session_id, active_labels, execute_status):
+    formatted = {}
+    if isinstance(result, dict):
+        for k, v in result.items():
+            if k not in POINT_FIELDS:
+                formatted[k] = v
+        for lbl in POINT_FIELDS:
+            formatted[lbl] = result.get(lbl) if lbl in active_labels else None
+    else:
+        formatted = result
+
+    formatted["session_id"] = session_id
+    formatted["execute"] = execute_status
+    formatted["execute_label"] = execute_status
+    return formatted
+
+
+def _run_cached_detect_screen(
+    data,
+    missing_session_response,
+    detection_error_response,
+    empty_response,
+    active_response,
+):
+    session_id = (data.get("session_id") or "").strip()
+    if session_id:
+        resumed = _resume_cached_session(session_id)
+        if not resumed:
+            return missing_session_response(session_id)
+
+        return active_response(session_id, *resumed)
+
     result, error = _run_detection(data)
     if error:
-        return error
+        return detection_error_response(error)
+
+    detected_session_id = result.get("session_id")
+    if detected_session_id:
+        resumed = _resume_cached_session(detected_session_id)
+        if resumed:
+            return active_response(detected_session_id, *resumed)
+
+    started = _start_cached_session(result)
+    if not started:
+        return empty_response(result)
+
+    detector_session_id, popped_label, remaining_labels = started
+    execute_status = "continue" if remaining_labels else "pass"
+    return active_response(
+        detector_session_id,
+        result,
+        popped_label,
+        remaining_labels,
+        execute_status,
+    )
+
+
+def _run_detect_screen_with_session(data):
+    return _run_cached_detect_screen(
+        data,
+        missing_session_response=lambda session_id: _error(f"Session '{session_id}' not found or expired."),
+        detection_error_response=lambda error: _error(error[0], status=error[1]),
+        empty_response=lambda result: _success(_format_option_b_response(result, None, [], "none")),
+        active_response=lambda session_id, result, popped_label, remaining_labels, execute_status: _success(
+            _format_option_b_response(
+                result,
+                session_id,
+                [] if popped_label is None else [popped_label] + remaining_labels,
+                execute_status,
+            )
+        ),
+    )
+
+
+def _format_detect_screen_response(session_id, popped_label, result, remaining_status):
+    point = result.get(popped_label) if popped_label else None
+    data = {
+        "execute_label": remaining_status,
+        "session_id": session_id,
+        "message": f"x={point[0]},y={point[1]}" if point is not None else None,
+        "edge": popped_label.capitalize() if popped_label else None
+    }
+    return jsonify({"success": True, "data": data})
+
+
+def _detect_screen_error(message, status=400):
+    return jsonify({
+        "success": False,
+        "data": {
+            "message": message,
+            "execute_label": "none"
+        }
+    }), status
+
+
+def _run_detect_screen_1by1(data):
+    return _run_cached_detect_screen(
+        data,
+        missing_session_response=lambda session_id: _detect_screen_error(f"Session '{session_id}' not found or expired."),
+        detection_error_response=lambda error: _detect_screen_error(error[0], status=error[1]),
+        empty_response=lambda result: _format_detect_screen_response(None, None, result, "none"),
+        active_response=lambda session_id, result, popped_label, _remaining_labels, execute_status: (
+            _format_detect_screen_response(session_id, popped_label, result, execute_status)
+        ),
+    )
+
+
+def _run_image_detection(data, requested_edge=None):
+    if requested_edge is None:
+        return _run_detect_screen_1by1(data)
+
+    result, error = _run_detection(data)
+    if error:
+        return _error(error[0], status=error[1])
 
     if requested_edge is not None and isinstance(result, dict) and result.get(requested_edge) is None:
         return _error(f"Edge '{requested_edge}' was not detected in this image.")
 
     return _success(_format_detector_response(result, requested_edge=requested_edge))
 
-
 @app.route("/api/v1/process_image", methods=["POST"])
-@app.route("/api/v1/detect_screen", methods=["POST"])
 def process_image():
     """
     Main inference endpoint. Matches training_type (e.g. FUJI_DETECTOR)
     and routes base64 encoded image to the correct handler.
     """
-    return _run_image_detection(_request_data())
+    result, error = _run_detection(_request_data())
+    if error:
+        return _error(error[0], status=error[1])
+    return _success(result)
+
+
+@app.route("/api/v1/detect_screen", methods=["POST"])
+def detect_screen():
+    return _run_detect_screen_1by1(_request_data())
 
 
 @app.route("/api/v1/top", methods=["POST"])
@@ -162,12 +384,8 @@ def process_image_right():
 
 @app.route("/api/v1/detect_screen/all", methods=["POST"])
 def detect_screen_all():
-    """Run inference once and return all detected edges."""
-    result, error = _run_detection(_request_data(default_training_type="FUJI_DETECTOR"))
-    if error:
-        return error
-
-    return _success(_format_all_edges(result))
+    """Run inference once and return all detected edges with session support."""
+    return _run_detect_screen_with_session(_request_data(default_training_type="FUJI_DETECTOR"))
 
 
 @app.route("/api/v1/detect_screen/next", methods=["POST"])
@@ -175,22 +393,16 @@ def detect_screen_next():
     """Return one edge per call, keyed by the transient sequence session_id."""
     data = _request_data(default_training_type="FUJI_DETECTOR")
 
-    session_id = data.get("session_id", "").strip()
+    session_id = (data.get("session_id") or "").strip()
 
     # ------------------------------------------------------------------
     # If we already have a live cache slot for this session, just pop the
     # next edge — no inference needed.
     # ------------------------------------------------------------------
-    if session_id and session_id in _seq_cache:
-        slot = _seq_cache[session_id]
-        remaining_labels = slot["edges"]
-        label = remaining_labels.pop(0)
-        point = slot["result"].get(label)
-
-        # Auto-clear after the last edge is consumed.
-        if not remaining_labels:
-            del _seq_cache[session_id]
-
+    resumed = _resume_cached_session(session_id) if session_id else None
+    if resumed:
+        result, label, remaining_labels, _ = resumed
+        point = result.get(label) if label is not None else None
         if point is None:
             return _error(f"Edge '{label}' was not detected in the cached result.")
 
@@ -213,39 +425,61 @@ def detect_screen_next():
 
     result, error = _run_detection(data)
     if error:
-        return error
+        return _error(error[0], status=error[1])
+
+    detected_session_id = result.get("session_id")
+    if detected_session_id:
+        resumed = _resume_cached_session(detected_session_id)
+        if resumed:
+            result, label, remaining_labels, _ = resumed
+            point = result.get(label) if label is not None else None
+            if point is None:
+                return _error(f"Edge '{label}' was not detected in the cached result.")
+
+            return _success({
+                "execute_label": label.capitalize(),
+                "message": f"x={point[0]},y={point[1]}",
+                "session_id": detected_session_id,
+                "edges_remaining": len(remaining_labels),
+            })
 
     # Build the ordered queue of edges that actually have a detected point.
-    detected = [lbl for lbl in POINT_FIELDS if result.get(lbl) is not None]
-    if not detected:
+    started = _start_cached_session(result)
+    if not started:
         return _error("No boundary points detected in this image.")
 
-    # Pop the first edge immediately to return on this call.
-    first_label = detected.pop(0)
+    detector_session_id, first_label, remaining_labels = started
     first_point = result[first_label]
-
-    detector_session_id = str(uuid.uuid4())
-
-    # Cache the remaining edges (may be empty if only 1 edge detected).
-    if detected:
-        _seq_cache[detector_session_id] = {"edges": detected, "result": result}
 
     return _success({
         "execute_label": first_label.capitalize(),
         "message": f"x={first_point[0]},y={first_point[1]}",
         "session_id": detector_session_id,
-        "edges_remaining": len(detected),
+        "edges_remaining": len(remaining_labels),
     })
 
 
-@app.route("/api/v1/clear_sessions", methods=["POST"])
+@app.route("/api/v1/clear_sessions", methods=["GET", "POST"])
 def clear_sessions():
     """Clear all accumulated session data (including sequential cache slots)."""
-    _seq_cache.clear()
-    return _success({"message": "Sessions cleared"})
+    _cache_clear()
+    return _success({"message": "All sessions cleared"})
+
+
+@app.route("/api/v1/clear_session", methods=["GET", "POST"])
+def clear_session():
+    """Clear a specific active session by ID."""
+    data = _request_data()
+    session_id = (data.get("session_id") or "").strip()
+    if not session_id:
+        return _error("Missing required parameter: 'session_id'")
+
+    _cache_delete(session_id)
+    return _success({"message": f"Session '{session_id}' cleared"})
 
 
 if __name__ == "__main__":
     from waitress import serve
-    print("Starting waitress server on port 5000...")
-    serve(app, host="0.0.0.0", port=5000)
+    port = int(os.environ.get("PORT", 5000))
+    print(f"Starting waitress server on port {port} (threads=1)...")
+    serve(app, host="0.0.0.0", port=port, threads=1)

@@ -1,12 +1,18 @@
 services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+
   api:
     build: .
-    container_name: fuji_detect_api
     ports:
       - "5000:5000"
     environment:
       - PYTHONUNBUFFERED=1
+      - REDIS_HOST=redis
+      - PORT=5000
+    depends_on:
+      - redis
     restart: unless-stopped
-    volumes:
-      - ./FUJI_DETECTOR:/app/FUJI_DETECTOR
-      - ./app.py:/app/app.py

@@ -30,6 +30,7 @@ TABLE_PARTS_NAME_COL_SLICE = slice(96, 205)
 TABLE_FEEDER_TYPE_COL_SLICE = slice(360, 440)
 KNOWN_FEEDER_TYPE_LABELS = (
     "Auto TC",
+    "8mmTape",
 )
 KNOWN_CYLINDER_PART_NAME_SUFFIXES = (
     "FWD200X-170",
@@ -564,6 +565,16 @@ def _sanitize_parts_name(text):
     if not any(ch.isalpha() for ch in cleaned):
         return None
     return cleaned
+
+
+def _normalize_cylinder_ocr_text(text):
+    return "".join(
+        {"O": "G", "J": "3", "D": "B", "I": "4"}.get(ch, ch)
+        for ch in text.upper()
+        if ch.isalnum()
+    )
+
+
 def normalize_circle_parts_name(parts_name):
     if not parts_name:
         return None
@@ -1051,15 +1062,16 @@ def _read_parts_name_from_crop(name_crop):
     raw_name = _sanitize_parts_name(_ocr_parts_name_from_crop(name_crop))
     if raw_name is not None:
         normalized_raw_name = "".join(ch for ch in raw_name.upper() if ch.isalnum())
+        cylinder_raw_name = _normalize_cylinder_ocr_text(raw_name)
         if len(normalized_raw_name) >= 6:
             best_ratio, second_ratio = 0.0, 0.0
             best_cylinder_name = None
             for candidate in KNOWN_CYLINDER_PART_NAME_SUFFIXES:
-                ratio = SequenceMatcher(
-                    None,
-                    normalized_raw_name,
-                    "".join(ch for ch in candidate.upper() if ch.isalnum()),
-                ).ratio()
+                normalized_candidate = "".join(ch for ch in candidate.upper() if ch.isalnum())
+                ratio = max(
+                    SequenceMatcher(None, normalized_raw_name, normalized_candidate).ratio(),
+                    SequenceMatcher(None, cylinder_raw_name, normalized_candidate).ratio(),
+                )
                 if ratio > best_ratio:
                     second_ratio = best_ratio
                     best_ratio = ratio
@@ -1308,8 +1320,8 @@ def detect_active_feeder_auto_tc(arr, active_row):
                 max_height_delta=8,
                 max_score=0.50,
             )
-            if matched_label == "Auto TC":
-                return True
+            if matched_label is not None:
+                return matched_label == "Auto TC"
 
         feeder_template_path = os.path.join(TEMPLATE_DIR, FEEDER_AUTO_TC_TEMPLATE)
         if not os.path.exists(feeder_template_path):
@@ -1389,6 +1401,8 @@ def resolve_auto_shape_type(active_row, active_feeder_auto_tc, template_match, a
         return "cylinder"
     if active_feeder_auto_tc is True:
         return "circle"
+    if active_feeder_auto_tc is False:
+        return None
     if template_match is not None:
         return "circle"
     return None
@@ -1820,8 +1834,11 @@ def run_inference(image_b64, shape_type=None):
                 result["_partial_cylinder"] = True
             return result
 
-        def build_session_id(session_suffix_override=None):
-            session_suffix = session_suffix_override or template_match or active_parts_name
+        def build_session_id(session_suffix_override=None, prefer_cylinder=False):
+            if prefer_cylinder and active_parts_name in KNOWN_CYLINDER_PART_NAME_SUFFIXES:
+                session_suffix = active_parts_name
+            else:
+                session_suffix = session_suffix_override or template_match or active_parts_name
             if not session_suffix:
                 return None
             if session_suffix not in KNOWN_CYLINDER_PART_NAME_SUFFIXES:
@@ -1847,7 +1864,7 @@ def run_inference(image_b64, shape_type=None):
                 "session_id" not in result and
                 any(result.get(name) is not None for name in ("top", "bottom", "left", "right"))
             ):
-                session_id = build_session_id()
+                session_id = build_session_id(prefer_cylinder=True)
                 if session_id is not None:
                     result = dict(result)
                     result["session_id"] = session_id

@@ -110,13 +110,12 @@ Main inference endpoint. Matches `training_type` and routes base64 encoded image
 **Response (Success - Circle)**
 ```json
 {
-  "status": "success",
+  "success": true,
   "data": {
-    "top": [139, 341],
-    "bottom": null,
-    "left": null,
-    "right": null,
-    "session_id": "session_2_t0.2*11.0"
+    "execute_label": "continue",
+    "session_id": "session_2_t0.2*11.0_4f9e8a7c",
+    "message": "139,341",
+    "edge": "Top"
   }
 }
 ```
@@ -185,7 +184,8 @@ Returned when processing circular components (e.g., washers). All detected bound
     "bottom": [148, 359],
     "left": [94, 305],
     "right": [202, 305],
-    "session_id": "session_8_t0.15*9.0"
+    "session_id": "session_8_t0.15*9.0",
+    "execute": "continue"
   }
 }
 ```
@@ -212,7 +212,8 @@ Returned when processing cylindrical components. Outputs the fitted `center`, th
     "right": [222, 301],
     "center": [138, 352],
     "radius": null,
-    "session_id": "session_9_KG3B_35_5F4Z"
+    "session_id": "session_9_KG3B_35_5F4Z",
+    "execute": "continue"
   }
 }
 ```
@@ -236,7 +237,8 @@ Returned when no active pattern is detected in the capture (e.g., empty backgrou
     "top": null,
     "bottom": null,
     "left": null,
-    "right": null
+    "right": null,
+    "execute": "pass"
   }
 }
 ```
