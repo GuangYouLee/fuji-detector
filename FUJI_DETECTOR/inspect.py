@@ -4213,8 +4213,17 @@ def run_inference(image_b64, shape_type=None):
             def detect_profiled_small_raw_hough_candidate():
                 if active_row == -1 or template_kind != "small":
                     return None
+                if dialog_present:
+                    return None
 
                 gray_raw = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
+                dialog_box = gray_raw[crop_px(75):crop_px(165), crop_px(95):crop_px(230)]
+                if (
+                    dialog_box.size and
+                    np.count_nonzero((dialog_box >= 90) & (dialog_box < 180)) > 300 and
+                    np.count_nonzero(dialog_box > 230) > 9000
+                ):
+                    return None
                 blur = cv2.medianBlur(gray_raw, 5)
                 edge_mask_raw = cv2.Canny(blur, 30, 90)
                 edge_mask_raw[~camera_mask] = 0
@@ -4228,7 +4237,7 @@ def run_inference(image_b64, shape_type=None):
                 max_radius = int(max(high for _, high in small_search_ranges))
                 best_candidate = None
                 best_key = None
-                bright_upper_small = crop_mean >= 230.0 and 12.0 <= crop_std < 20.0 and crop_p5 < 220.0
+                bright_upper_small = crop_mean >= 230.0 and 12.0 <= crop_std <= 23.0 and crop_p5 < 220.0
 
                 for param1, param2 in ((30, 10), (50, 12), (80, 14)):
                     circles = cv2.HoughCircles(
