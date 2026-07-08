@@ -158,31 +158,6 @@ def _format_detector_response(result, requested_edge=None):
     }
 
 
-def _format_all_edges(result):
-    """Return all four boundary pixels from a single inference result.
-
-    Each present edge is returned in the same ``execute_label / message``
-    shape that the individual edge endpoints use, so the calling script can
-    reuse the same parsing logic for every entry.
-    """
-    if not isinstance(result, dict):
-        return result
-
-    edges = {}
-    for label in POINT_FIELDS:
-        point = result.get(label)
-        edges[label] = (
-            {"execute_label": label.capitalize(), "message": f"x={point[0]},y={point[1]}"}
-            if point is not None
-            else None
-        )
-
-    return {
-        "session_id": result.get("session_id"),
-        "edges": edges,
-    }
-
-
 def _resume_cached_session(session_id):
     slot = _cache_get(session_id)
     if not slot:
@@ -240,45 +215,6 @@ def _format_option_b_response(result, session_id, active_labels, execute_status)
     return formatted
 
 
-def _run_cached_detect_screen(
-    data,
-    missing_session_response,
-    detection_error_response,
-    empty_response,
-    active_response,
-):
-    session_id = (data.get("session_id") or "").strip()
-    if session_id:
-        resumed = _resume_cached_session(session_id)
-        if not resumed:
-            return missing_session_response(session_id)
-
-        return active_response(session_id, *resumed)
-
-    result, error = _run_detection(data, tolerate_unsupported_resolution=True)
-    if error:
-        return detection_error_response(error)
-
-    detected_session_id = result.get("session_id")
-    if detected_session_id:
-        resumed = _resume_cached_session(detected_session_id)
-        if resumed:
-            return active_response(detected_session_id, *resumed)
-
-    started = _start_cached_session(result)
-    if not started:
-        return empty_response(result)
-
-    detector_session_id, popped_label, remaining_labels = started
-    execute_status = "continue" if remaining_labels else "pass"
-    return active_response(
-        detector_session_id,
-        result,
-        popped_label,
-        remaining_labels,
-        execute_status,
-    )
-
 
 def _run_detect_screen_with_session(data):
     result, error = _run_detection(data, tolerate_unsupported_resolution=True)
@@ -324,14 +260,37 @@ def _detect_screen_error(message, status=400):
 
 
 def _run_detect_screen_1by1(data):
-    return _run_cached_detect_screen(
-        data,
-        missing_session_response=lambda session_id: _detect_screen_error(f"Session '{session_id}' not found or expired."),
-        detection_error_response=lambda error: _detect_screen_error(error[0], status=error[1]),
-        empty_response=lambda result: _format_detect_screen_response(None, None, result, "none"),
-        active_response=lambda session_id, result, popped_label, _remaining_labels, execute_status: (
-            _format_detect_screen_response(session_id, popped_label, result, execute_status)
-        ),
+    session_id = (data.get("session_id") or "").strip()
+    if session_id:
+        resumed = _resume_cached_session(session_id)
+        if not resumed:
+            return _detect_screen_error(f"Session '{session_id}' not found or expired.")
+
+        result, popped_label, _, remaining_status = resumed
+        return _format_detect_screen_response(session_id, popped_label, result, remaining_status)
+
+    result, error = _run_detection(data, tolerate_unsupported_resolution=True)
+    if error:
+        return _detect_screen_error(error[0], status=error[1])
+
+    detected_session_id = result.get("session_id")
+    if detected_session_id:
+        resumed = _resume_cached_session(detected_session_id)
+        if resumed:
+            result, popped_label, _, remaining_status = resumed
+            return _format_detect_screen_response(detected_session_id, popped_label, result, remaining_status)
+
+    started = _start_cached_session(result)
+    if not started:
+        return _format_detect_screen_response(None, None, result, "none")
+
+    detector_session_id, popped_label, remaining_labels = started
+    execute_status = "continue" if remaining_labels else "pass"
+    return _format_detect_screen_response(
+        detector_session_id,
+        popped_label,
+        result,
+        execute_status,
     )
 
 
@@ -363,30 +322,11 @@ def process_image():
 @app.route("/api/v1/detect_screen", methods=["POST"])
 def detect_screen():
     return _run_detect_screen_1by1(_request_data())
+@app.route("/api/v1/<any(top, bottom, left, right):edge>", methods=["POST"])
+@app.route("/api/v1/detect_screen/<any(top, bottom, left, right):edge>", methods=["POST"])
+def process_image_edge(edge):
+    return _run_image_detection(_request_data(), requested_edge=edge)
 
-
-@app.route("/api/v1/top", methods=["POST"])
-@app.route("/api/v1/detect_screen/top", methods=["POST"])
-def process_image_top():
-    return _run_image_detection(_request_data(), requested_edge="top")
-
-
-@app.route("/api/v1/bottom", methods=["POST"])
-@app.route("/api/v1/detect_screen/bottom", methods=["POST"])
-def process_image_bottom():
-    return _run_image_detection(_request_data(), requested_edge="bottom")
-
-
-@app.route("/api/v1/left", methods=["POST"])
-@app.route("/api/v1/detect_screen/left", methods=["POST"])
-def process_image_left():
-    return _run_image_detection(_request_data(), requested_edge="left")
-
-
-@app.route("/api/v1/right", methods=["POST"])
-@app.route("/api/v1/detect_screen/right", methods=["POST"])
-def process_image_right():
-    return _run_image_detection(_request_data(), requested_edge="right")
 
 
 @app.route("/api/v1/detect_screen/all", methods=["POST"])

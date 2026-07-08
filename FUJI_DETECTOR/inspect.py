@@ -2063,6 +2063,20 @@ def run_inference(image_b64, shape_type=None):
                 active_parts_name = ocr_parts_name(table_arr, active_row)
                 parts_name_profile = resolve_circle_profile_with_template_override(active_parts_name, best_template)
                 if (
+                    parts_name_profile is None and
+                    best_template is not None and
+                    best_template[4] == "large" and
+                    best_template[7] <= 85.0 and
+                    camera_crop_mean_hint < 190.0 and
+                    camera_crop_std_hint >= 35.0
+                ):
+                    template_match, template_ranges, template_nominal, template_kind = (
+                        best_template[0],
+                        best_template[2],
+                        best_template[3],
+                        best_template[4],
+                    )
+                elif (
                     weak_small_template is not None and
                     (
                         parts_name_profile is None or
@@ -4314,6 +4328,81 @@ def run_inference(image_b64, shape_type=None):
 
                 return best_candidate
 
+            def detect_large_raw_hough_candidate():
+                if template_kind != "large":
+                    return None
+
+                gray_raw = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
+                blur = cv2.medianBlur(gray_raw, 5)
+                edge_mask_raw = cv2.Canny(blur, 25, 90)
+                edge_mask_raw[~camera_mask] = 0
+                edge_y, edge_x = np.where(edge_mask_raw > 0)
+                if len(edge_x) < 80:
+                    return None
+
+                edge_x_full = edge_x.astype(float) + x_start
+                edge_y_full = edge_y.astype(float) + y_start
+                min_radius = int(max(1, min(low for low, _ in large_search_ranges)))
+                max_radius = int(max(high for _, high in large_search_ranges))
+                best_candidate = None
+                best_key = None
+
+                for param1, param2 in ((20, 6), (30, 8), (50, 10)):
+                    circles = cv2.HoughCircles(
+                        blur,
+                        cv2.HOUGH_GRADIENT,
+                        dp=1.2,
+                        minDist=40,
+                        param1=param1,
+                        param2=param2,
+                        minRadius=min_radius,
+                        maxRadius=max_radius,
+                    )
+                    if circles is None:
+                        continue
+                    for cx_local, cy_local, radius in circles[0]:
+                        cx_full = float(cx_local) + x_start
+                        cy_full = float(cy_local) + y_start
+                        radius = float(radius)
+                        residuals = np.abs(np.hypot(edge_x_full - cx_full, edge_y_full - cy_full) - radius)
+                        support_mask = residuals <= max(6.0, radius * 0.05)
+                        if np.count_nonzero(support_mask) < 40:
+                            continue
+                        support_x = edge_x_full[support_mask]
+                        support_y = edge_y_full[support_mask]
+                        metrics = get_circle_support_metrics(support_x, support_y, cx_full, cy_full, radius)
+                        if metrics["coverage_bins"] < 3 or metrics["residual_mean"] > 8.0:
+                            continue
+                        visible_candidates = [
+                            (cx_full, cy_full - radius),
+                            (cx_full, cy_full + radius),
+                            (cx_full - radius, cy_full),
+                            (cx_full + radius, cy_full),
+                        ]
+                        if not any(0 <= x < arr.shape[1] and 0 <= y < arr.shape[0] for x, y in visible_candidates):
+                            continue
+                        key = (
+                            abs(radius - large_nominal),
+                            -metrics["coverage_bins"],
+                            metrics["residual_mean"],
+                            -metrics["support_count"],
+                            param2,
+                        )
+                        if best_key is None or key < best_key:
+                            best_key = key
+                            best_candidate = {
+                                "circle": (cx_full, cy_full, radius),
+                                "support_x": support_x,
+                                "support_y": support_y,
+                                "metrics": metrics,
+                                "sort_key": key,
+                                "source": "large_raw_hough",
+                            }
+                    if best_candidate is not None:
+                        return best_candidate
+
+                return best_candidate
+
             def detect_opencv_circle_candidate(target_kind):
                 search_ranges = small_search_ranges if target_kind == "small" else large_search_ranges
                 nominal_radius = small_nominal if target_kind == "small" else large_nominal
@@ -5305,11 +5394,13 @@ def run_inference(image_b64, shape_type=None):
             best_offset_small_candidate = None
             best_crosshair_small_candidate = None
             best_profiled_small_raw_hough_candidate = None
+            best_large_raw_hough_candidate = None
             prefer_large_without_profile = False
 
             if template_kind != "large":
                 best_opencv_small_candidate = detect_opencv_circle_candidate("small")
             best_profiled_small_raw_hough_candidate = detect_profiled_small_raw_hough_candidate()
+            best_large_raw_hough_candidate = detect_large_raw_hough_candidate()
             if template_kind == "medium" or (active_row != -1 and active_feeder_auto_tc is True):
                 best_medium_hough_candidate = detect_medium_hough_circle_candidate()
             best_profile_hough_candidate = detect_profile_hough_circle_candidate()
@@ -5497,6 +5588,8 @@ def run_inference(image_b64, shape_type=None):
                 best_profiled_small_raw_hough_candidate is None
             ):
                 best_candidate = best_large_candidate if best_large_candidate is not None else best_small_candidate
+                if best_candidate is None and best_large_raw_hough_candidate is not None:
+                    best_candidate = best_large_raw_hough_candidate
             else:
                 if template_kind == "medium":
                     best_candidate = choose_candidate(best_small_candidate, best_opencv_small_candidate)
@@ -5684,7 +5777,7 @@ def run_inference(image_b64, shape_type=None):
                         cyl_res.get("right") is not None
                     ):
                         return finalize_result(cyl_res, is_cylinder=True)
-                    if template_kind == "large":
+                    if cyl_res is None and template_kind == "large":
                         circle_res = detect_circle()
                         if circle_res is not None:
                             return circle_res
