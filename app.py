@@ -112,7 +112,7 @@ def _request_data(default_training_type=None):
     return data
 
 
-def _run_detection(data):
+def _run_detection(data, tolerate_unsupported_resolution=False):
     try:
         if not data:
             raise ValueError("Request body must be JSON.")
@@ -135,7 +135,9 @@ def _run_detection(data):
 
     if isinstance(result, dict) and "error" in result:
         if "Unsupported image resolution" in result["error"]:
-            return {}, None
+            if tolerate_unsupported_resolution:
+                return {}, None
+            return None, (result["error"], 400)
         return None, (result["error"], 400)
 
     return result, None
@@ -253,7 +255,7 @@ def _run_cached_detect_screen(
 
         return active_response(session_id, *resumed)
 
-    result, error = _run_detection(data)
+    result, error = _run_detection(data, tolerate_unsupported_resolution=True)
     if error:
         return detection_error_response(error)
 
@@ -279,19 +281,24 @@ def _run_cached_detect_screen(
 
 
 def _run_detect_screen_with_session(data):
-    return _run_cached_detect_screen(
-        data,
-        missing_session_response=lambda session_id: _error(f"Session '{session_id}' not found or expired."),
-        detection_error_response=lambda error: _error(error[0], status=error[1]),
-        empty_response=lambda result: _success(_format_option_b_response(result, None, [], "none")),
-        active_response=lambda session_id, result, popped_label, remaining_labels, execute_status: _success(
-            _format_option_b_response(
-                result,
-                session_id,
-                [] if popped_label is None else [popped_label] + remaining_labels,
-                execute_status,
-            )
-        ),
+    result, error = _run_detection(data, tolerate_unsupported_resolution=True)
+    if error:
+        return _error(error[0], status=error[1])
+
+    detected_session_id = result.get("session_id")
+    if detected_session_id:
+        _cache_delete(detected_session_id)
+
+    detected = [label for label in POINT_FIELDS if result.get(label) is not None]
+    execute_status = "none" if not detected else "pass"
+
+    return _success(
+        _format_option_b_response(
+            result,
+            detected_session_id,
+            detected,
+            execute_status,
+        )
     )
 
 
@@ -332,7 +339,7 @@ def _run_image_detection(data, requested_edge=None):
     if requested_edge is None:
         return _run_detect_screen_1by1(data)
 
-    result, error = _run_detection(data)
+    result, error = _run_detection(data, tolerate_unsupported_resolution=True)
     if error:
         return _error(error[0], status=error[1])
 
@@ -423,7 +430,7 @@ def detect_screen_next():
             "Provide it on the first call (no session_id) to start a new sequence."
         )
 
-    result, error = _run_detection(data)
+    result, error = _run_detection(data, tolerate_unsupported_resolution=True)
     if error:
         return _error(error[0], status=error[1])
 
@@ -446,7 +453,12 @@ def detect_screen_next():
     # Build the ordered queue of edges that actually have a detected point.
     started = _start_cached_session(result)
     if not started:
-        return _error("No boundary points detected in this image.")
+        return _success({
+            "execute_label": "none",
+            "message": None,
+            "session_id": None,
+            "edges_remaining": 0,
+        })
 
     detector_session_id, first_label, remaining_labels = started
     first_point = result[first_label]

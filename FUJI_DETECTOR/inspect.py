@@ -165,7 +165,7 @@ def infer_circle_session_suffix(template_match, active_parts_name, radius):
 def should_reject_partial_small_circle(shape_type, template_kind, visible_names):
     return (
         template_kind == "small" and
-        visible_names in (("top",), ("bottom",), ("left",), ("right",), ("bottom", "right"))
+        visible_names in (("top",), ("bottom",), ("left",), ("right",), ("bottom", "left"), ("bottom", "right"))
     )
 
 
@@ -1115,55 +1115,6 @@ def _probe_active_row_parts_name(arr, active_row, row_y_start, row_height, row_s
     return best_name, best_score, best_offset
 
 
-def _has_ambiguous_small_medium_parts_name(arr, active_row, row_y_start, row_height, row_stride, parts_name_slice, parts_name_width):
-    best_small_score = float("inf")
-    best_medium_score = float("inf")
-    small_matched = False
-    medium_matched = False
-
-    for y_offset in _iter_active_row_y_offsets(arr):
-        active_y_start = row_y_start + active_row * row_stride + y_offset
-        active_y_end = active_y_start + row_height
-        if active_y_start < 0 or active_y_end > arr.shape[0]:
-            continue
-
-        name_crop = normalize_text_crop(
-            arr[active_y_start:active_y_end, parts_name_slice],
-            parts_name_width,
-            29,
-        )
-        gray = cv2.cvtColor(name_crop, cv2.COLOR_RGB2GRAY)
-
-        small_name, small_score, _ = _rank_text_candidates(gray, ("t0.3*2.0",), 12, 8)
-        medium_name, medium_score, _ = _rank_text_candidates(
-            gray,
-            ("t0.15*9.0", "t0.15*9", "t0.2*9.0", "t0.2*9"),
-            12,
-            8,
-        )
-        if small_name is not None:
-            small_matched = True
-            best_small_score = min(best_small_score, small_score)
-        if medium_name is not None:
-            medium_matched = True
-            best_medium_score = min(best_medium_score, medium_score)
-
-        if _match_known_text(gray, ("t0.3*2.0",), 18, 10, 1.2) is not None:
-            small_matched = True
-        if _match_known_text(gray, ("t0.15*9.0", "t0.15*9", "t0.2*9.0", "t0.2*9"), 18, 10, 1.2) is not None:
-            medium_matched = True
-
-    return (
-        small_matched and
-        medium_matched and
-        (
-            best_small_score == float("inf") or
-            best_medium_score == float("inf") or
-            best_small_score <= best_medium_score + 0.10
-        )
-    )
-
-
 def ocr_part_number(arr, active_row):
     """Recognizes the part number for the active visible row from the No. column."""
     try:
@@ -1388,8 +1339,8 @@ def detect_active_feeder_auto_tc(arr, active_row):
         )
         feeder_gray = cv2.cvtColor(feeder_crop, cv2.COLOR_RGB2GRAY)
         feeder_match = classify_feeder_crop(feeder_gray)
-        if feeder_match is True:
-            return True
+        if feeder_match is not None:
+            return feeder_match
 
     return None
 
@@ -1399,11 +1350,16 @@ def resolve_auto_shape_type(active_row, active_feeder_auto_tc, template_match, a
         return None
     if active_parts_name in KNOWN_CYLINDER_PART_NAME_SUFFIXES:
         return "cylinder"
+    if resolve_circle_profile_from_name(active_parts_name) is not None:
+        return "circle"
     if active_feeder_auto_tc is True:
+        return "circle"
+    template_profile = resolve_circle_profile_from_name(template_match)
+    if template_profile is not None and template_profile[3] in ("small", "medium"):
         return "circle"
     if active_feeder_auto_tc is False:
         return None
-    if template_match is not None:
+    if template_profile is not None:
         return "circle"
     return None
 
@@ -1411,8 +1367,6 @@ def resolve_auto_shape_type(active_row, active_feeder_auto_tc, template_match, a
 # signature measured on this machine. Only candidates matching this exact
 # signature are rejected as the bezel. Real parts that are merely offset
 # from the crosshairs (but not at the bezel's position) are NOT affected.
-BEZEL_R_LOW = 0.0
-BEZEL_R_HIGH = 99999.0
 BEZEL_CENTER_DX = -9.5
 BEZEL_CENTER_DY = 14.9
 BEZEL_CENTER_TOL = 1.5
@@ -1420,8 +1374,6 @@ DEFAULT_CROSS_X = 147
 DEFAULT_CROSS_Y = 341
 
 def is_bezel(xc, yc, R, xc_cross, yc_cross):
-    if not (BEZEL_R_LOW <= R <= BEZEL_R_HIGH):
-        return False
     if abs(xc - (xc_cross + BEZEL_CENTER_DX)) > BEZEL_CENTER_TOL:
         return False
     if abs(yc - (yc_cross + BEZEL_CENTER_DY)) > BEZEL_CENTER_TOL:
@@ -1454,7 +1406,6 @@ def find_crosshair_center(arr):
     x_cyan = x_cyan[valid_rows]
     y_cyan = y_cyan[valid_rows]
     if len(x_cyan) > 50:
-        from collections import Counter
         return int(Counter(x_cyan).most_common(1)[0][0]), int(Counter(y_cyan).most_common(1)[0][0])
 
     return scale_frame_x(arr, DEFAULT_CROSS_X), scale_frame_y(arr, DEFAULT_CROSS_Y)
@@ -1823,20 +1774,19 @@ def run_inference(image_b64, shape_type=None):
         frame_scale_x = 1.0
         frame_scale_y = 1.0
 
-        def make_no_detect_result(partial_cylinder=False):
-            result = {
+        def make_no_detect_result():
+            return {
                 "top": None,
                 "bottom": None,
                 "left": None,
                 "right": None,
             }
-            if partial_cylinder:
-                result["_partial_cylinder"] = True
-            return result
 
         def build_session_id(session_suffix_override=None, prefer_cylinder=False):
             if prefer_cylinder and active_parts_name in KNOWN_CYLINDER_PART_NAME_SUFFIXES:
                 session_suffix = active_parts_name
+            elif prefer_cylinder and active_feeder_auto_tc is False:
+                session_suffix = "KG3B_35_5F4Z"
             else:
                 session_suffix = session_suffix_override or template_match or active_parts_name
             if not session_suffix:
@@ -1855,9 +1805,6 @@ def run_inference(image_b64, shape_type=None):
         def finalize_result(result, is_cylinder=False):
             if result is None:
                 return None
-            if isinstance(result, dict) and "_partial_cylinder" in result:
-                result = dict(result)
-                result.pop("_partial_cylinder", None)
             if (
                 is_cylinder and
                 isinstance(result, dict) and
@@ -1892,9 +1839,6 @@ def run_inference(image_b64, shape_type=None):
             if not isinstance(result, dict):
                 return False
             return result.get("left") is not None or result.get("right") is not None
-
-        def is_partial_cylinder_result(result):
-            return isinstance(result, dict) and result.get("_partial_cylinder") is True
 
         # Decode base64 image
         if "base64," in image_b64:
@@ -1945,16 +1889,6 @@ def run_inference(image_b64, shape_type=None):
             raise ValueError(f"Image dimensions {arr.shape[:2]} are smaller than camera box")
 
         crop = arr[y_start:y_end, x_start:x_end]
-
-        # Check if the corners of the crop are dark (bezel present/M285 machine)
-        # We check the average of 4 small corner regions (10x10)
-        h, w = crop.shape[:2]
-        corner_mean = (
-            np.mean(crop[:10, :10]) +
-            np.mean(crop[:10, -10:]) +
-            np.mean(crop[-10:, :10]) +
-            np.mean(crop[-10:, -10:])
-        ) / 4.0
 
         template_match = None
         template_ranges = None
@@ -2074,9 +2008,40 @@ def run_inference(image_b64, shape_type=None):
                         if diff <= max_diff and (best_match is None or match_score < best_match[5]):
                             best_match = (part_name, ranges, r_nom, kind, diff, match_score)
 
+                weak_small_template = None
+                weak_medium_template = None
+                camera_crop_mean_hint = float(np.mean(crop))
+                camera_crop_std_hint = float(np.std(crop))
+                if best_template is not None and best_template[4] != "small":
+                    for part_name, filename, ranges, r_nom, kind, _max_diff in template_configs:
+                        if kind == "medium" and weak_medium_template is None:
+                            weak_medium_template = (part_name, ranges, r_nom, kind)
+                        if kind != "small":
+                            continue
+                        if filename is None:
+                            template_arr = _render_parts_name_mask(part_name, (mask_active.shape[1], mask_active.shape[0]), 0, 0)
+                        else:
+                            template_path = os.path.join(TEMPLATE_DIR, filename)
+                            if not os.path.exists(template_path):
+                                continue
+                            template_img = Image.open(template_path).convert("L")
+                            template_arr = np.array(template_img)
+                        if mask_active.shape != template_arr.shape:
+                            continue
+                        diff, match_score = score_parts_name_template_match(mask_active, template_arr)
+                        if match_score <= best_template[7] + 3.0 and match_score <= 65.0:
+                            weak_small_template = (part_name, ranges, r_nom, kind)
+                            break
+
                 best_9mm_name, best_9mm_score, second_9mm_score = _rank_text_candidates(
                     crop_gray,
                     ("t0.15*9.0", "t0.15*9", "t0.2*9.0", "t0.2*9"),
+                    8,
+                    5,
+                )
+                best_2mm_name, best_2mm_score, second_2mm_score = _rank_text_candidates(
+                    crop_gray,
+                    ("t0.3*2.0",),
                     8,
                     5,
                 )
@@ -2098,6 +2063,50 @@ def run_inference(image_b64, shape_type=None):
                 active_parts_name = ocr_parts_name(table_arr, active_row)
                 parts_name_profile = resolve_circle_profile_with_template_override(active_parts_name, best_template)
                 if (
+                    weak_small_template is not None and
+                    (
+                        parts_name_profile is None or
+                        parts_name_profile[3] == "medium"
+                    )
+                ):
+                    if best_template is not None and best_template[4] == "large":
+                        if camera_crop_mean_hint >= 230.0 or (
+                            camera_crop_mean_hint < 190.0 and
+                            camera_crop_std_hint < 35.0
+                        ):
+                            template_match, template_ranges, template_nominal, template_kind = weak_small_template
+                        elif camera_crop_mean_hint >= 190.0 and weak_medium_template is not None:
+                            template_match, template_ranges, template_nominal, template_kind = weak_medium_template
+                        else:
+                            template_match, template_ranges, template_nominal, template_kind = (
+                                best_template[0],
+                                best_template[2],
+                                best_template[3],
+                                best_template[4],
+                            )
+                    else:
+                        template_match, template_ranges, template_nominal, template_kind = weak_small_template
+                elif (
+                    (parts_name_profile is None or parts_name_profile[3] == "medium") and
+                    best_template is not None and
+                    best_template[4] == "small" and
+                    best_template[7] <= 65.0
+                ):
+                    template_match, template_ranges, template_nominal, template_kind = (
+                        best_template[0],
+                        best_template[2],
+                        best_template[3],
+                        best_template[4],
+                    )
+                elif (
+                    parts_name_profile is not None and
+                    parts_name_profile[3] == "medium" and
+                    best_2mm_name is not None and
+                    best_2mm_score <= 0.65 and
+                    best_2mm_score <= best_9mm_score + 0.04
+                ):
+                    template_match, template_ranges, template_nominal, template_kind = resolve_circle_profile_from_name(best_2mm_name)
+                elif (
                     parts_name_profile is not None and
                     parts_name_profile[3] == "medium" and
                     best_match is not None and
@@ -2379,7 +2388,7 @@ def run_inference(image_b64, shape_type=None):
                         pair_overlap <= 10.0 and
                         center_separation >= 0.6 * max(left_r, right_r) and
                         not (right_near_cross and left_far_from_cross) and
-                        not pair_sits_low
+                        not (pair_sits_low and active_feeder_auto_tc is not False)
                     ):
                         left_candidate = left_option
                         right_candidate = right_option
@@ -2392,11 +2401,11 @@ def run_inference(image_b64, shape_type=None):
 
             if left_candidate is None and right_candidate is None:
                 if had_partial_candidate:
-                    return make_no_detect_result(partial_cylinder=True)
+                    return make_no_detect_result()
                 return None
 
             if left_candidate is None or right_candidate is None:
-                return make_no_detect_result(partial_cylinder=True)
+                return make_no_detect_result()
 
             def get_candidate_box(side_name, candidate):
                 fit_x, fit_y, fit_r = candidate["circle"]
@@ -2670,7 +2679,7 @@ def run_inference(image_b64, shape_type=None):
                 refined_width = rect_right - rect_left
                 refined_height = rect_bottom - rect_top
                 if refined_height > refined_width * 0.62:
-                    return make_no_detect_result(partial_cylinder=True)
+                    return make_no_detect_result()
                 if (
                     refined_width < raw_box_width - 8 or
                     refined_width > raw_box_width + 8 or
@@ -4139,9 +4148,11 @@ def run_inference(image_b64, shape_type=None):
                 return best_candidate
 
             def detect_crosshair_small_hough_candidate():
-                if active_row == -1 or active_feeder_auto_tc is not True:
+                if active_row == -1:
                     return None
                 if template_kind != "small":
+                    return None
+                if active_feeder_auto_tc is not True and resolve_circle_profile_from_name(active_parts_name) is None:
                     return None
 
                 nominal_radius = small_nominal if small_nominal is not None else 54.0
@@ -4199,6 +4210,101 @@ def run_inference(image_b64, shape_type=None):
 
                 return best_candidate
 
+            def detect_profiled_small_raw_hough_candidate():
+                if active_row == -1 or template_kind != "small":
+                    return None
+
+                gray_raw = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
+                blur = cv2.medianBlur(gray_raw, 5)
+                edge_mask_raw = cv2.Canny(blur, 30, 90)
+                edge_mask_raw[~camera_mask] = 0
+                edge_y, edge_x = np.where(edge_mask_raw > 0)
+                if len(edge_x) < 40:
+                    return None
+
+                edge_x_full = edge_x.astype(float) + x_start
+                edge_y_full = edge_y.astype(float) + y_start
+                min_radius = int(max(1, min(low for low, _ in small_search_ranges)))
+                max_radius = int(max(high for _, high in small_search_ranges))
+                best_candidate = None
+                best_key = None
+                bright_upper_small = crop_mean >= 230.0 and 12.0 <= crop_std < 20.0 and crop_p5 < 220.0
+
+                for param1, param2 in ((30, 10), (50, 12), (80, 14)):
+                    circles = cv2.HoughCircles(
+                        blur,
+                        cv2.HOUGH_GRADIENT,
+                        dp=1.2,
+                        minDist=30,
+                        param1=param1,
+                        param2=param2,
+                        minRadius=min_radius,
+                        maxRadius=max_radius,
+                    )
+                    if circles is None:
+                        continue
+                    for cx_local, cy_local, radius in circles[0]:
+                        cx_full = float(cx_local) + x_start
+                        cy_full = float(cy_local) + y_start
+                        radius = float(radius)
+                        center_distance = float(np.hypot(cx_full - xc_cross, cy_full - yc_cross))
+                        upper_off_crosshair = (
+                            bright_upper_small and
+                            abs(cx_full - xc_cross) <= 30.0 and
+                            cy_full < yc_cross
+                        )
+                        if not upper_off_crosshair and center_distance > max(24.0, radius * 0.55):
+                            continue
+
+                        residuals = np.abs(np.hypot(edge_x_full - cx_full, edge_y_full - cy_full) - radius)
+                        support_mask = residuals <= max(5.0, radius * 0.12)
+                        if np.count_nonzero(support_mask) < 20:
+                            continue
+
+                        support_x = edge_x_full[support_mask]
+                        support_y = edge_y_full[support_mask]
+                        metrics = get_circle_support_metrics(support_x, support_y, cx_full, cy_full, radius)
+                        if metrics["coverage_bins"] < 4 or metrics["residual_mean"] > 6.0 or metrics["residual_p90"] > 11.0:
+                            continue
+
+                        radius_bias = abs(radius - small_nominal) if small_nominal is not None else 0.0
+                        if upper_off_crosshair:
+                            expected_top_y = yc_cross - max(96.0, radius * 2.0)
+                            key = (
+                                0,
+                                abs((cy_full - radius) - expected_top_y),
+                                radius_bias,
+                                abs(cx_full - xc_cross),
+                                -metrics["coverage_bins"],
+                                metrics["residual_mean"],
+                                -metrics["support_count"],
+                                param2,
+                            )
+                        else:
+                            key = (
+                                1,
+                                radius_bias,
+                                center_distance,
+                                -metrics["coverage_bins"],
+                                metrics["residual_mean"],
+                                -metrics["support_count"],
+                                param2,
+                            )
+                        if best_key is None or key < best_key:
+                            best_key = key
+                            best_candidate = {
+                                "circle": (cx_full, cy_full, radius),
+                                "support_x": support_x,
+                                "support_y": support_y,
+                                "metrics": metrics,
+                                "sort_key": key,
+                                "source": "profiled_small_raw_hough",
+                            }
+                    if best_candidate is not None:
+                        return best_candidate
+
+                return best_candidate
+
             def detect_opencv_circle_candidate(target_kind):
                 search_ranges = small_search_ranges if target_kind == "small" else large_search_ranges
                 nominal_radius = small_nominal if target_kind == "small" else large_nominal
@@ -4219,6 +4325,12 @@ def run_inference(image_b64, shape_type=None):
                     template_kind == "small" and
                     has_label_overlay
                 )
+                profiled_small_candidate = (
+                    target_kind == "small" and
+                    template_kind == "small" and
+                    active_row != -1 and
+                    active_feeder_auto_tc is True
+                )
                 if (
                     target_kind == "large" or
                     (has_label_overlay and not overlay_candidate) or
@@ -4227,7 +4339,8 @@ def run_inference(image_b64, shape_type=None):
                         not bright_faint_candidate and
                         not centered_bright_candidate and
                         not bright_edge_candidate and
-                        not overlay_candidate
+                        not overlay_candidate and
+                        not profiled_small_candidate
                     )
                 ):
                     return None
@@ -4278,7 +4391,7 @@ def run_inference(image_b64, shape_type=None):
 
                 best_hough_candidate = None
                 best_hough_key = None
-                if bright_faint_candidate or bright_edge_candidate or overlay_candidate or medium_candidate:
+                if bright_faint_candidate or bright_edge_candidate or overlay_candidate or medium_candidate or profiled_small_candidate:
                     hough_median = cv2.medianBlur(work, 5)
                     hough_equalized = cv2.equalizeHist(hough_median)
                     hough_inputs = (
@@ -4359,7 +4472,13 @@ def run_inference(image_b64, shape_type=None):
                                 best_hough_key = hough_key
                                 best_hough_candidate = candidate
 
-                if (bright_faint_candidate or bright_edge_candidate or overlay_candidate or medium_candidate) and best_hough_candidate is not None:
+                if (
+                    bright_faint_candidate or
+                    bright_edge_candidate or
+                    overlay_candidate or
+                    medium_candidate or
+                    profiled_small_candidate
+                ) and best_hough_candidate is not None:
                     return best_hough_candidate
 
                 best_candidate = None
@@ -5176,10 +5295,12 @@ def run_inference(image_b64, shape_type=None):
             best_profile_hough_candidate = None
             best_offset_small_candidate = None
             best_crosshair_small_candidate = None
+            best_profiled_small_raw_hough_candidate = None
             prefer_large_without_profile = False
 
             if template_kind != "large":
                 best_opencv_small_candidate = detect_opencv_circle_candidate("small")
+            best_profiled_small_raw_hough_candidate = detect_profiled_small_raw_hough_candidate()
             if template_kind == "medium" or (active_row != -1 and active_feeder_auto_tc is True):
                 best_medium_hough_candidate = detect_medium_hough_circle_candidate()
             best_profile_hough_candidate = detect_profile_hough_circle_candidate()
@@ -5362,7 +5483,10 @@ def run_inference(image_b64, shape_type=None):
                                 build_circle_candidate(arc_circle, x_arc_fit, y_arc_fit, large_nominal, "large"),
                             )
 
-            if template_kind == "large" or prefer_large_without_profile:
+            if template_kind == "large" or (
+                prefer_large_without_profile and
+                best_profiled_small_raw_hough_candidate is None
+            ):
                 best_candidate = best_large_candidate if best_large_candidate is not None else best_small_candidate
             else:
                 if template_kind == "medium":
@@ -5425,8 +5549,15 @@ def run_inference(image_b64, shape_type=None):
                         )
                     ):
                         best_candidate = best_crosshair_small_candidate
+                if best_profiled_small_raw_hough_candidate is not None:
+                    best_candidate = choose_small_circle_candidate(
+                        best_candidate,
+                        best_profiled_small_raw_hough_candidate,
+                    )
                 best_candidate = refine_small_outer_ring_candidate(best_candidate)
                 best_candidate = refine_small_crosshair_candidate(best_candidate)
+                if best_profiled_small_raw_hough_candidate is not None:
+                    best_candidate = best_profiled_small_raw_hough_candidate
 
             if best_candidate is None:
                 return None
@@ -5486,7 +5617,14 @@ def run_inference(image_b64, shape_type=None):
                     support_metrics.get("support_count", 0) >= 20 and
                     support_metrics.get("coverage_bins", 0) >= 6
                 )
-                if template_kind == "small" and visible_count >= 2 and support_is_adequate:
+                if (
+                    template_kind == "small" and
+                    support_is_adequate and
+                    (
+                        visible_count >= 2 or
+                        best_candidate.get("source") == "profiled_small_raw_hough"
+                    )
+                ):
                     for name, pixel in raw_pixels.items():
                         if visible_pixels[name] is not None:
                             continue
@@ -5497,7 +5635,10 @@ def run_inference(image_b64, shape_type=None):
                 name for name in ("top", "bottom", "left", "right")
                 if visible_pixels[name] is not None
             )
-            if should_reject_partial_small_circle(shape_type, template_kind, visible_names):
+            if (
+                best_candidate.get("source") != "profiled_small_raw_hough" and
+                should_reject_partial_small_circle(shape_type, template_kind, visible_names)
+            ):
                 return None
 
             res = {
@@ -5534,6 +5675,10 @@ def run_inference(image_b64, shape_type=None):
                         cyl_res.get("right") is not None
                     ):
                         return finalize_result(cyl_res, is_cylinder=True)
+                    if template_kind == "large":
+                        circle_res = detect_circle()
+                        if circle_res is not None:
+                            return circle_res
                 if should_try_uncertain_circle_fallback(active_row, active_feeder_auto_tc, auto_shape_type, active_parts_name=active_parts_name):
                     shape_type = "circle"
                     circle_res = detect_circle()
