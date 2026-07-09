@@ -6,7 +6,7 @@ from difflib import SequenceMatcher
 from functools import lru_cache
 import numpy as np
 import cv2
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 
 import os
 
@@ -280,7 +280,7 @@ def circle_from_3_points(p1, p2, p3):
 
 @lru_cache(maxsize=None)
 def _load_fuji_font(size):
-    import PIL.ImageFont as ImageFont
+
 
     for fp in FUJI_FONT_CANDIDATES:
         if not fp:
@@ -293,14 +293,11 @@ def _load_fuji_font(size):
 
 @lru_cache(maxsize=1)
 def _digit_templates():
-    import PIL.Image as PILImage
-    import PIL.ImageDraw as ImageDraw
-
     font = _load_fuji_font(11)
 
     templates = {}
     for digit in "0123456789":
-        img = PILImage.new("L", (16, 16), 0)
+        img = Image.new("L", (16, 16), 0)
         draw = ImageDraw.Draw(img)
         draw.text((2, 2), digit, font=font, fill=255)
         arr_d = np.array(img)
@@ -328,14 +325,13 @@ def _match_digit(char_img):
 
 @lru_cache(maxsize=1)
 def _parts_name_templates():
-    import PIL.Image as PILImage
-    import PIL.ImageDraw as ImageDraw
+
 
     font = _load_fuji_font(11)
 
     templates = {}
     for char in "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.*/":
-        img = PILImage.new("L", (20, 20), 0)
+        img = Image.new("L", (20, 20), 0)
         draw = ImageDraw.Draw(img)
         draw.text((2, 2), char, font=font, fill=255)
         arr_c = np.array(img)
@@ -350,10 +346,9 @@ def _match_parts_name_char(char_img):
 
 
 def _render_parts_name_mask(text, size, x_offset, y_offset):
-    import PIL.Image as PILImage
-    import PIL.ImageDraw as ImageDraw
 
-    img = PILImage.new("L", size, 0)
+
+    img = Image.new("L", size, 0)
     draw = ImageDraw.Draw(img)
     draw.text((x_offset, y_offset), text, font=_load_fuji_font(11), fill=255)
     return np.array(img)
