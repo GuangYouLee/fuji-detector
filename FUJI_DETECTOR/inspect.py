@@ -4973,18 +4973,18 @@ def run_inference(image_b64, shape_type=None):
             best_medium_hough_candidate = None
             best_profile_hough_candidate = None
             best_crosshair_small_candidate = None
-            best_profiled_small_raw_hough_candidate = None
             best_large_raw_hough_candidate = None
             prefer_large_without_profile = False
 
-            if template_kind != "large":
-                best_opencv_small_candidate = detect_opencv_circle_candidate("small")
             best_profiled_small_raw_hough_candidate = detect_profiled_small_raw_hough_candidate()
-            best_large_raw_hough_candidate = detect_large_raw_hough_candidate()
-            if template_kind == "medium" or (active_row != -1 and active_feeder_auto_tc is True):
-                best_medium_hough_candidate = detect_medium_hough_circle_candidate()
-            best_profile_hough_candidate = detect_profile_hough_circle_candidate()
-            best_crosshair_small_candidate = detect_crosshair_small_hough_candidate()
+            if best_profiled_small_raw_hough_candidate is None:
+                if template_kind != "large":
+                    best_opencv_small_candidate = detect_opencv_circle_candidate("small")
+                best_large_raw_hough_candidate = detect_large_raw_hough_candidate()
+                if template_kind == "medium" or (active_row != -1 and active_feeder_auto_tc is True):
+                    best_medium_hough_candidate = detect_medium_hough_circle_candidate()
+                best_profile_hough_candidate = detect_profile_hough_circle_candidate()
+                best_crosshair_small_candidate = detect_crosshair_small_hough_candidate()
 
             if template_kind != "large" and small_anchor_mode is None:
                 contrast_components = extract_connected_components(contrast_edge_mask, min_pixels=6)
@@ -5227,11 +5227,6 @@ def run_inference(image_b64, shape_type=None):
                         )
                     ):
                         best_candidate = best_crosshair_small_candidate
-                if best_profiled_small_raw_hough_candidate is not None:
-                    best_candidate = choose_small_circle_candidate(
-                        best_candidate,
-                        best_profiled_small_raw_hough_candidate,
-                    )
                 if best_profiled_small_raw_hough_candidate is not None:
                     best_candidate = best_profiled_small_raw_hough_candidate
 
