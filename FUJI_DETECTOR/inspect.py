@@ -1,5 +1,4 @@
 import base64
-import io
 import random
 from collections import Counter
 from difflib import SequenceMatcher
@@ -111,13 +110,6 @@ def get_table_layout(arr):
         "feeder_slice": scale_frame_x_slice(arr, TABLE_FEEDER_TYPE_COL_SLICE),
         "feeder_width": TABLE_FEEDER_TYPE_COL_SLICE.stop - TABLE_FEEDER_TYPE_COL_SLICE.start,
     }
-
-
-def scale_radius_ranges(ranges, scale):
-    return [
-        (max(1, int(round(low * scale))), max(1, int(round(high * scale))))
-        for low, high in ranges
-    ]
 
 
 def normalize_text_crop(crop, target_width, target_height):
@@ -1766,9 +1758,6 @@ def run_inference(image_b64, shape_type=None):
             None / 'circle' – auto-detect (default circle/RANSAC path).
     """
     try:
-        frame_scale_x = 1.0
-        frame_scale_y = 1.0
-
         def make_no_detect_result():
             return {
                 "top": None,
@@ -1840,15 +1829,16 @@ def run_inference(image_b64, shape_type=None):
             image_b64 = image_b64.split("base64,")[1]
 
         img_data = base64.b64decode(image_b64)
-        img = Image.open(io.BytesIO(img_data)).convert("RGB")
-        if img.size != (1024, 768):
-            return {"error": f"Unsupported image resolution: {img.size}. Expected 1024x768."}
-        original_arr = np.array(img)
+        img = cv2.imdecode(np.frombuffer(img_data, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if img is None:
+            return {"error": "Failed to decode image data."}
+        if img.shape[1] != 1024 or img.shape[0] != 768:
+            return {"error": f"Unsupported image resolution: {(img.shape[1], img.shape[0])}. Expected 1024x768."}
+        original_arr = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         table_arr = original_arr
         frame_scale_x = get_frame_scale_x(original_arr)
         frame_scale_y = get_frame_scale_y(original_arr)
         arr = normalize_fuji_frame_size(original_arr)
-        layout_scale = get_frame_uniform_scale(arr)
 
         # 1. Dynamically locate the cyan guide-line center
         xc_cross, yc_cross = find_crosshair_center(arr)
@@ -1936,34 +1926,19 @@ def run_inference(image_b64, shape_type=None):
                 marker_rows.append(False)
 
         active_row = -1
-        if layout_scale >= 1.15:
-            if row_averages:
-                best_idx = min(
-                    range(len(row_selection_deltas)),
-                    key=lambda idx: (row_selection_deltas[idx], -row_midtone_scores[idx], row_averages[idx]),
-                )
-                if row_selection_deltas[best_idx] <= 28.0 and row_midtone_scores[best_idx] >= 0.04:
-                    active_row = best_idx
-                else:
-                    min_idx = int(np.argmin(row_averages))
-                    if row_averages[min_idx] < 210:
-                        active_row = min_idx
-            if active_row == -1 and marker_rows.count(True) == 1:
-                active_row = marker_rows.index(True)
-        else:
-            if marker_rows.count(True) == 1:
-                active_row = marker_rows.index(True)
-            elif row_averages:
-                best_idx = min(
-                    range(len(row_selection_deltas)),
-                    key=lambda idx: (row_selection_deltas[idx], -row_midtone_scores[idx], row_averages[idx]),
-                )
-                if row_selection_deltas[best_idx] <= 28.0 and row_midtone_scores[best_idx] >= 0.04:
-                    active_row = best_idx
-                else:
-                    min_idx = int(np.argmin(row_averages))
-                    if row_averages[min_idx] < 210:
-                        active_row = min_idx
+        if marker_rows.count(True) == 1:
+            active_row = marker_rows.index(True)
+        elif row_averages:
+            best_idx = min(
+                range(len(row_selection_deltas)),
+                key=lambda idx: (row_selection_deltas[idx], -row_midtone_scores[idx], row_averages[idx]),
+            )
+            if row_selection_deltas[best_idx] <= 28.0 and row_midtone_scores[best_idx] >= 0.04:
+                active_row = best_idx
+            else:
+                min_idx = int(np.argmin(row_averages))
+                if row_averages[min_idx] < 210:
+                    active_row = min_idx
         if active_row != -1:
             y_start_row = row_y_start + active_row * row_stride
             y_end_row = y_start_row + row_height
@@ -2821,24 +2796,12 @@ def run_inference(image_b64, shape_type=None):
             else:
                 small_anchor_mode = None
 
-            resolved_circle_profile = resolve_circle_profile_from_name(template_match or active_parts_name)
-            resolved_profile_name = resolved_circle_profile[0] if resolved_circle_profile is not None else None
-            use_unscaled_small_profile = layout_scale >= 1.15 and resolved_profile_name == "t0.3*2.0"
-            small_search_ranges = (
-                template_ranges if use_unscaled_small_profile
-                else scale_radius_ranges(template_ranges, layout_scale)
-            ) if template_kind in ("small", "medium") else scale_radius_ranges([(20, 65)], layout_scale)
-            small_nominal = (
-                template_nominal if use_unscaled_small_profile else (template_nominal * layout_scale)
-            ) if template_kind in ("small", "medium") and template_nominal is not None else None
-            medium_search_ranges = scale_radius_ranges([(65, 90)], layout_scale)
-            medium_nominal = 75 * layout_scale
-            large_search_ranges = (
-                scale_radius_ranges(template_ranges, layout_scale)
-                if template_kind == "large"
-                else scale_radius_ranges([(200, 320)], layout_scale)
-            )
-            large_nominal = (template_nominal * layout_scale) if template_kind == "large" and template_nominal is not None else (240 * layout_scale)
+            small_search_ranges = template_ranges if template_kind in ("small", "medium") else [(20, 65)]
+            small_nominal = template_nominal if template_kind in ("small", "medium") and template_nominal is not None else None
+            medium_search_ranges = [(65, 90)]
+            medium_nominal = 75
+            large_search_ranges = template_ranges if template_kind == "large" else [(200, 320)]
+            large_nominal = template_nominal if template_kind == "large" and template_nominal is not None else 240
 
             # Circular camera window mask: only consider pixels within the camera
             # window (radius ~120 pixels, centered at 127, 127 in the crop). Pixels
@@ -3247,241 +3210,7 @@ def run_inference(image_b64, shape_type=None):
                             ):
                                 return edge_candidate
 
-                resolved_small_profile = resolve_circle_profile_from_name(template_match or active_parts_name)
-                if (
-                    layout_scale >= 1.15 and
-                    resolved_small_profile is not None and
-                    resolved_small_profile[0] == "t0.3*2.0"
-                ):
-                    edge_circle = edge_candidate.get("circle")
-                    opencv_circle = opencv_candidate.get("circle")
-                    if edge_circle is not None and opencv_circle is not None:
-                        edge_modes = infer_small_anchor_modes(edge_candidate.get("support_x"), edge_candidate.get("support_y"))
-                        opencv_modes = infer_small_anchor_modes(opencv_candidate.get("support_x"), opencv_candidate.get("support_y"))
-                        if not edge_modes:
-                            edge_modes = [None]
-                        if not opencv_modes:
-                            opencv_modes = [None]
-
-                        def best_anchor_error(circle_fit, anchor_modes):
-                            xc_fit, yc_fit, radius_fit = circle_fit
-                            return min(
-                                get_circle_anchor_error(
-                                    xc_fit,
-                                    yc_fit,
-                                    radius_fit,
-                                    xc_cross,
-                                    yc_cross,
-                                    anchor_mode=mode,
-                                )
-                                for mode in anchor_modes
-                            )
-
-                        edge_anchor_error = best_anchor_error(edge_circle, edge_modes)
-                        opencv_anchor_error = best_anchor_error(opencv_circle, opencv_modes)
-                        edge_metrics = edge_candidate.get("metrics") or {}
-                        opencv_metrics = opencv_candidate.get("metrics") or {}
-                        if (
-                            edge_anchor_error + (8.0 ** 2) < opencv_anchor_error and
-                            edge_metrics.get("residual_mean", float("inf")) <= opencv_metrics.get("residual_mean", float("inf")) + 0.8 and
-                            edge_metrics.get("residual_p90", float("inf")) <= opencv_metrics.get("residual_p90", float("inf")) + 1.0
-                        ):
-                            return edge_candidate
-
                 return opencv_candidate
-
-            def refine_small_outer_ring_candidate(candidate):
-                if candidate is None or layout_scale < 1.15:
-                    return candidate
-                resolved_small_profile = resolve_circle_profile_from_name(template_match or active_parts_name)
-                profile_name = resolved_small_profile[0] if resolved_small_profile is not None else None
-                active_auto_tc_medium_probe = template_kind is None and active_row != -1 and active_feeder_auto_tc is True
-                if profile_name == "t0.3*2.0":
-                    return candidate
-                if template_kind == "medium" or template_kind == "large":
-                    return candidate
-                if candidate["circle"][2] > 65.0:
-                    return candidate
-                if small_nominal is not None and small_nominal < 45.0 and profile_name != "t0.3*2.0":
-                    return candidate
-
-                xc_fit, yc_fit, R_fit = candidate["circle"]
-
-                current_profile = get_medium_ring_evidence_profile(xc_fit, yc_fit, R_fit)
-                current_visible = resolve_circle_pixel_visibility(
-                    xc_fit,
-                    yc_fit,
-                    R_fit,
-                    candidate["support_x"],
-                    candidate["support_y"],
-                )
-                current_visible_count = sum(
-                    1 for name in ("top", "bottom", "left", "right")
-                    if current_visible[name] is not None
-                )
-                search_high = max(high for _, high in small_search_ranges)
-                if active_auto_tc_medium_probe:
-                    search_high = max(search_high, max(high for _, high in medium_search_ranges))
-                if current_visible_count >= 4 and R_fit >= 45.0:
-                    search_high = max(search_high, 90.0)
-                if search_high <= R_fit + 6.0:
-                    return candidate
-                inferred_modes = infer_small_anchor_modes(candidate["support_x"], candidate["support_y"])
-                if not inferred_modes:
-                    inferred_modes = [None]
-
-                def best_anchor_error_for_radius(radius_value):
-                    return min(
-                        get_circle_anchor_error(
-                            xc_fit,
-                            yc_fit,
-                            float(radius_value),
-                            xc_cross,
-                            yc_cross,
-                            anchor_mode=mode,
-                        )
-                        for mode in inferred_modes
-                    )
-
-                current_anchor_error = best_anchor_error_for_radius(R_fit)
-                preferred_nominal = (
-                    medium_nominal if active_auto_tc_medium_probe
-                    else (small_nominal if small_nominal is not None else R_fit)
-                )
-                best_radius = float(R_fit)
-                best_key = (
-                    current_profile["dark_cardinals"],
-                    current_profile["dark_bins"],
-                    current_profile["mean_strength"],
-                    -current_anchor_error,
-                    -abs(float(R_fit) - preferred_nominal),
-                    -float(R_fit),
-                )
-
-                if active_auto_tc_medium_probe:
-                    search_low = max(R_fit + 6.0, preferred_nominal - 22.0)
-                    search_stop = float(search_high)
-                elif current_visible_count >= 4 and R_fit >= 45.0:
-                    search_low = max(R_fit + 6.0, 65.0)
-                    search_stop = float(search_high)
-                else:
-                    search_low = max(R_fit + 6.0, preferred_nominal - 14.0)
-                    search_stop = min(float(search_high), preferred_nominal + 14.0)
-                if search_stop <= search_low:
-                    search_low = R_fit + 6.0
-                    search_stop = float(search_high)
-
-                for trial_radius in np.arange(search_low, search_stop + 0.1, 1.0):
-                    trial_profile = get_medium_ring_evidence_profile(xc_fit, yc_fit, float(trial_radius))
-                    if trial_profile["visible_bins"] < 10:
-                        continue
-
-                    improves_ring = (
-                        trial_profile["dark_cardinals"] >= current_profile["dark_cardinals"] + 1 or
-                        trial_profile["dark_bins"] >= current_profile["dark_bins"] + 4 or
-                        trial_profile["mean_strength"] >= current_profile["mean_strength"] + 2.0
-                    )
-                    if not improves_ring:
-                        continue
-
-                    trial_visible = resolve_circle_pixel_visibility(
-                        xc_fit,
-                        yc_fit,
-                        float(trial_radius),
-                        candidate["support_x"],
-                        candidate["support_y"],
-                    )
-                    trial_visible_count = sum(
-                        1 for name in ("top", "bottom", "left", "right")
-                        if trial_visible[name] is not None
-                    )
-                    if trial_visible_count < current_visible_count:
-                        continue
-                    trial_anchor_error = best_anchor_error_for_radius(trial_radius)
-                    if trial_anchor_error > current_anchor_error + (8.0 ** 2):
-                        continue
-
-                    trial_key = (
-                        trial_profile["dark_cardinals"],
-                        trial_profile["dark_bins"],
-                        trial_profile["mean_strength"],
-                        -trial_anchor_error,
-                        -abs(float(trial_radius) - preferred_nominal),
-                        -float(trial_radius),
-                    )
-                    if trial_key > best_key:
-                        best_key = trial_key
-                        best_radius = float(trial_radius)
-
-                if best_radius <= R_fit + 4.0:
-                    local_xc = xc_fit - x_start
-                    local_yc = yc_fit - y_start
-                    valid_sample_mask = camera_mask & (~dilated_ui)
-                    sample_radius = 3
-                    darkness_margin = max(5.0, min(12.0, crop_std * 0.45 + 2.0))
-
-                    def sample_patch_mean(px, py):
-                        x_c = int(round(px))
-                        y_c = int(round(py))
-                        x0 = max(0, x_c - sample_radius)
-                        x1 = min(mean_val.shape[1], x_c + sample_radius + 1)
-                        y0 = max(0, y_c - sample_radius)
-                        y1 = min(mean_val.shape[0], y_c + sample_radius + 1)
-                        if x0 >= x1 or y0 >= y1:
-                            return None
-                        patch_mask = valid_sample_mask[y0:y1, x0:x1]
-                        if np.count_nonzero(patch_mask) < 4:
-                            return None
-                        return float(np.mean(mean_val[y0:y1, x0:x1][patch_mask]))
-
-                    probe_radii = []
-                    probe_start = int(round(max(R_fit + 6.0, search_low)))
-                    probe_stop = int(round(search_stop))
-                    for dx, dy in ((0.0, -1.0), (0.0, 1.0), (-1.0, 0.0), (1.0, 0.0)):
-                        best_probe = None
-                        for trial_radius in range(probe_start, probe_stop + 1):
-                            inner_mean = sample_patch_mean(
-                                local_xc + dx * max(1.0, trial_radius - 5.0),
-                                local_yc + dy * max(1.0, trial_radius - 5.0),
-                            )
-                            ring_mean = sample_patch_mean(
-                                local_xc + dx * trial_radius,
-                                local_yc + dy * trial_radius,
-                            )
-                            outer_mean = sample_patch_mean(
-                                local_xc + dx * (trial_radius + 5.0),
-                                local_yc + dy * (trial_radius + 5.0),
-                            )
-                            if inner_mean is None or ring_mean is None or outer_mean is None:
-                                continue
-                            score = (0.5 * (inner_mean + outer_mean)) - ring_mean
-                            if score < darkness_margin:
-                                continue
-                            probe_key = (score, -abs(float(trial_radius) - preferred_nominal), float(trial_radius))
-                            if best_probe is None or probe_key > best_probe[0]:
-                                best_probe = (probe_key, float(trial_radius))
-                        if best_probe is not None:
-                            probe_radii.append(best_probe[1])
-
-                    if len(probe_radii) >= 3:
-                        median_probe_radius = float(np.median(probe_radii))
-                        probe_anchor_error = best_anchor_error_for_radius(median_probe_radius)
-                        if (
-                            median_probe_radius > R_fit + 6.0 and
-                            probe_anchor_error <= current_anchor_error + (8.0 ** 2)
-                        ):
-                            best_radius = median_probe_radius
-                        else:
-                            return candidate
-                    else:
-                        return candidate
-
-                refined_candidate = dict(candidate)
-                refined_candidate["circle"] = (xc_fit, yc_fit, best_radius)
-                return refined_candidate
-
-            def refine_small_crosshair_candidate(candidate):
-                return candidate
 
             def get_medium_visibility_profile(xc_fit, yc_fit, R_fit):
                 total_bins = 24
@@ -3757,20 +3486,10 @@ def run_inference(image_b64, shape_type=None):
                             yc_cross,
                             anchor_mode=None,
                         )
-                    off_crosshair_circle_mode = (
-                        layout_scale >= 1.15 and
-                        active_row != -1 and
-                        active_feeder_auto_tc is True and
-                        boundary_margin >= 0.0 and
-                        metrics["coverage_bins"] >= 10 and
-                        metrics["cardinal_support"] >= 3 and
-                        center_distance >= max(32.0, R_fit * 0.55)
-                    )
                     if (
                         not medium_mode and
                         not bright_faint_mode and
                         not center_teaching_mode and
-                        not off_crosshair_circle_mode and
                         circumference_error > max(18.0, R_fit * 0.4)
                     ):
                         return None
@@ -3795,20 +3514,6 @@ def run_inference(image_b64, shape_type=None):
                             metrics["residual_mean"],
                             -metrics["support_count"],
                             circumference_error,
-                        )
-                    elif off_crosshair_circle_mode:
-                        sort_key = (
-                            0,
-                            radius_bias,
-                            metrics["residual_mean"],
-                            metrics["residual_p90"],
-                            -R_fit,
-                            -metrics["cardinal_support"],
-                            -metrics["coverage_bins"],
-                            max(0.0, -boundary_margin),
-                            metrics["largest_gap_bins"],
-                            -metrics["support_count"],
-                            center_distance,
                         )
                     elif medium_mode:
                         if not is_valid_medium_candidate(metrics, medium_visibility_profile, medium_ring_profile):
@@ -4054,101 +3759,6 @@ def run_inference(image_b64, shape_type=None):
                                 "metrics": metrics,
                                 "sort_key": key,
                                 "source": "profile_hough",
-                            }
-
-                    if best_candidate is not None:
-                        return best_candidate
-
-                return best_candidate
-
-            def detect_offset_small_hough_candidate():
-                if not (layout_scale >= 1.15 and active_row != -1 and active_feeder_auto_tc is True and active_parts_name is None):
-                    return None
-
-                valid_mask = camera_mask & is_gray_local & is_not_cyan & (~dilated_ui)
-                if np.count_nonzero(valid_mask) < 1000:
-                    return None
-
-                gray_raw = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
-                fill_value = int(np.median(gray_raw[valid_mask]))
-                work = gray_raw.copy()
-                work[~valid_mask] = fill_value
-                blur = cv2.medianBlur(work, 5)
-
-                edge_mask_hough = cv2.Canny(blur, 35, 100)
-                edge_mask_hough[~valid_mask] = 0
-                edge_y, edge_x = np.where(edge_mask_hough > 0)
-                if len(edge_x) < 50:
-                    return None
-
-                edge_x_full = edge_x.astype(float) + x_start
-                edge_y_full = edge_y.astype(float) + y_start
-                best_candidate = None
-                best_key = None
-
-                for param2 in (18, 16, 14, 20):
-                    circles = cv2.HoughCircles(
-                        blur,
-                        cv2.HOUGH_GRADIENT,
-                        dp=1.1,
-                        minDist=40,
-                        param1=80,
-                        param2=param2,
-                        minRadius=40,
-                        maxRadius=70,
-                    )
-                    if circles is None:
-                        continue
-
-                    for cx_local, cy_local, radius_seed in circles[0][:10]:
-                        cx_seed = float(cx_local + x_start)
-                        cy_seed = float(cy_local + y_start)
-                        radius_seed = float(radius_seed)
-
-                        residuals = np.abs(
-                            np.sqrt((edge_x_full - cx_seed) ** 2 + (edge_y_full - cy_seed) ** 2) - radius_seed
-                        )
-                        support_mask = residuals <= max(4.0, radius_seed * 0.10)
-                        if np.count_nonzero(support_mask) < 20:
-                            continue
-
-                        support_x = edge_x_full[support_mask]
-                        support_y = edge_y_full[support_mask]
-                        metrics = get_circle_support_metrics(
-                            support_x,
-                            support_y,
-                            cx_seed,
-                            cy_seed,
-                            radius_seed,
-                            tolerance=max(4.0, min(8.0, radius_seed * 0.12)),
-                        )
-                        center_distance = float(np.hypot(cx_seed - xc_cross, cy_seed - yc_cross))
-                        if center_distance < max(40.0, radius_seed * 0.65):
-                            continue
-                        if metrics["support_count"] < 40 or metrics["coverage_bins"] < 8 or metrics["cardinal_support"] < 2:
-                            continue
-                        if metrics["residual_mean"] > 5.0 or metrics["residual_p90"] > 9.0:
-                            continue
-
-                        key = (
-                            0 if metrics["cardinal_support"] >= 4 else 1,
-                            -metrics["coverage_bins"],
-                            metrics["residual_mean"],
-                            metrics["residual_p90"],
-                            center_distance,
-                            -radius_seed,
-                            -metrics["support_count"],
-                            param2,
-                        )
-                        if best_key is None or key < best_key:
-                            best_key = key
-                            best_candidate = {
-                                "circle": (cx_seed, cy_seed, radius_seed),
-                                "support_x": support_x,
-                                "support_y": support_y,
-                                "metrics": metrics,
-                                "sort_key": key,
-                                "source": "offset_small_hough",
                             }
 
                     if best_candidate is not None:
@@ -4937,15 +4547,6 @@ def run_inference(image_b64, shape_type=None):
                         return None
                     if not medium_mode and anchor_error > 80.0 ** 2:
                         return None
-                    off_crosshair_circle_mode = (
-                        layout_scale >= 1.15 and
-                        active_row != -1 and
-                        active_feeder_auto_tc is True and
-                        boundary_margin >= 0.0 and
-                        metrics["coverage_bins"] >= 10 and
-                        metrics["cardinal_support"] >= 3 and
-                        center_distance >= max(32.0, R_fit * 0.55)
-                    )
                     medium_visibility_profile = get_medium_visibility_profile(xc_fit, yc_fit, R_fit) if medium_mode else None
                     medium_ring_profile = get_medium_ring_evidence_profile(xc_fit, yc_fit, R_fit) if medium_mode else None
                     if medium_mode:
@@ -4970,7 +4571,6 @@ def run_inference(image_b64, shape_type=None):
                                 return None
                         if (
                             not bright_edge_mode and
-                            not off_crosshair_circle_mode and
                             circumference_error > max(18.0, R_fit * 0.4)
                         ):
                             return None
@@ -5015,20 +4615,6 @@ def run_inference(image_b64, shape_type=None):
                             anchor_error,
                             max(0.0, -boundary_margin),
                             sector_ratio,
-                        )
-                    elif off_crosshair_circle_mode:
-                        sort_key = (
-                            0,
-                            radius_bias,
-                            metrics["residual_mean"],
-                            metrics["residual_p90"],
-                            -R_fit,
-                            -metrics["cardinal_support"],
-                            -metrics["coverage_bins"],
-                            max(0.0, -boundary_margin),
-                            metrics["largest_gap_bins"],
-                            -metrics["support_count"],
-                            center_distance,
                         )
                     else:
                         interior_priority = 0 if boundary_margin >= 8.0 else 1
@@ -5386,7 +4972,6 @@ def run_inference(image_b64, shape_type=None):
             best_opencv_small_candidate = None
             best_medium_hough_candidate = None
             best_profile_hough_candidate = None
-            best_offset_small_candidate = None
             best_crosshair_small_candidate = None
             best_profiled_small_raw_hough_candidate = None
             best_large_raw_hough_candidate = None
@@ -5399,7 +4984,6 @@ def run_inference(image_b64, shape_type=None):
             if template_kind == "medium" or (active_row != -1 and active_feeder_auto_tc is True):
                 best_medium_hough_candidate = detect_medium_hough_circle_candidate()
             best_profile_hough_candidate = detect_profile_hough_circle_candidate()
-            best_offset_small_candidate = detect_offset_small_hough_candidate()
             best_crosshair_small_candidate = detect_crosshair_small_hough_candidate()
 
             if template_kind != "large" and small_anchor_mode is None:
@@ -5629,9 +5213,6 @@ def run_inference(image_b64, shape_type=None):
                         ))
                         if hough_distance + 18.0 < current_distance:
                             best_candidate = best_profile_hough_candidate
-                if best_offset_small_candidate is not None:
-                    if best_candidate is None or count_visible_circle_points(best_offset_small_candidate) >= count_visible_circle_points(best_candidate):
-                        best_candidate = best_offset_small_candidate
                 if best_crosshair_small_candidate is not None:
                     current_profile_name = None if best_candidate is None else infer_circle_session_suffix(
                         template_match,
@@ -5651,8 +5232,6 @@ def run_inference(image_b64, shape_type=None):
                         best_candidate,
                         best_profiled_small_raw_hough_candidate,
                     )
-                best_candidate = refine_small_outer_ring_candidate(best_candidate)
-                best_candidate = refine_small_crosshair_candidate(best_candidate)
                 if best_profiled_small_raw_hough_candidate is not None:
                     best_candidate = best_profiled_small_raw_hough_candidate
 
