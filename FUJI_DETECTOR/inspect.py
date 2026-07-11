@@ -1873,6 +1873,13 @@ def run_inference(image_b64, shape_type=None):
         if (x_end - x_start) < 200 or (y_end - y_start) < 200:
             raise ValueError(f"Image dimensions {arr.shape[:2]} are smaller than camera box")
 
+        dialog_title = arr[250:310, 300:500].astype(np.int16)
+        if dialog_title.size and np.count_nonzero(
+            (dialog_title[:, :, 2] - dialog_title[:, :, 0] > 25) &
+            (dialog_title[:, :, 2] - dialog_title[:, :, 1] > 10)
+        ) > 800:
+            return finalize_result(make_no_detect_result())
+
         crop = arr[y_start:y_end, x_start:x_end]
 
         template_match = None
@@ -2858,7 +2865,7 @@ def run_inference(image_b64, shape_type=None):
             dialog_present = np.count_nonzero(dialog_region) > 800
 
             if dialog_present:
-                DIALOG_X_LO = 142
+                return finalize_result(make_no_detect_result())
 
             preserve_faint_upper_right_target = (
                 template_kind == "small" and

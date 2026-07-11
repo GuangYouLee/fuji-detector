@@ -154,7 +154,7 @@ def _format_detector_response(result, requested_edge=None):
     return {
         "execute_label": requested_edge.capitalize() if point is not None else None,
         "session_id": result.get("session_id"),
-        "message": f"x={point[0]},y={point[1]}" if point is not None else None,
+        "message": f"x={point[0]},y={point[1]}" if point is not None else "x=null,y=null",
     }
 
 
@@ -243,7 +243,7 @@ def _format_detect_screen_response(session_id, popped_label, result, remaining_s
     data = {
         "execute_label": remaining_status,
         "session_id": session_id,
-        "message": f"x={point[0]},y={point[1]}" if point is not None else None,
+        "message": f"x={point[0]},y={point[1]}" if point is not None else "x=null,y=null",
         "edge": popped_label.capitalize() if popped_label else None
     }
     return jsonify({"success": True, "data": data})
@@ -395,7 +395,7 @@ def detect_screen_next():
     if not started:
         return _success({
             "execute_label": "none",
-            "message": None,
+            "message": "x=null,y=null",
             "session_id": None,
             "edges_remaining": 0,
         })
