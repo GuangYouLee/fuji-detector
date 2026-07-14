@@ -1,5 +1,7 @@
 import base64
 import random
+import shutil
+import subprocess
 from collections import Counter
 from difflib import SequenceMatcher
 from functools import lru_cache
@@ -59,6 +61,8 @@ ALL_KNOWN_PART_NAMES = KNOWN_CYLINDER_PART_NAME_SUFFIXES + tuple(dict.fromkeys(
 BASE_FRAME_WIDTH = 800
 BASE_FRAME_HEIGHT = 600
 TARGET_FRAME_SIZE = (BASE_FRAME_WIDTH, BASE_FRAME_HEIGHT)
+TEACH_BUTTON_REGION = (728, 571, 802, 647)
+TEACH_ICON_REGION = (735, 570, 805, 615)
 
 
 def normalize_fuji_frame_size(arr):
@@ -346,6 +350,15 @@ def _render_parts_name_mask(text, size, x_offset, y_offset):
     return np.array(img)
 
 
+@lru_cache(maxsize=3)
+def _load_template_mask(filename):
+    template_path = os.path.join(TEMPLATE_DIR, filename)
+    if not os.path.exists(template_path):
+        return None
+    with Image.open(template_path) as template_img:
+        return np.array(template_img.convert("L"))
+
+
 def _foreground_bbox(mask):
     ys, xs = np.where(mask > 0)
     if len(xs) == 0 or len(ys) == 0:
@@ -467,7 +480,7 @@ def _generate_text_masks(gray):
     return masks
 
 
-def _rank_text_candidates(gray, candidates, max_width_delta, max_height_delta):
+def _rank_text_candidates(gray, candidates, max_width_delta, max_height_delta, text_masks=None):
     """Scores every candidate against every generated text mask and returns
     (best_name, best_score, second_score) where the margin is measured between
     the best and second-best *different* candidate (not the same candidate from
@@ -475,7 +488,7 @@ def _rank_text_candidates(gray, candidates, max_width_delta, max_height_delta):
     candidates = tuple(candidates)
     best_per_candidate = {}
 
-    for text_mask in _generate_text_masks(gray):
+    for text_mask in text_masks if text_masks is not None else _generate_text_masks(gray):
         actual_bbox = _foreground_bbox(text_mask)
         if actual_bbox is None:
             continue
@@ -526,10 +539,10 @@ def _rank_text_candidates(gray, candidates, max_width_delta, max_height_delta):
     return best_name, best_score, second_score
 
 
-def _match_known_text(gray, candidates, max_width_delta=6, max_height_delta=4, max_score=0.60):
+def _match_known_text(gray, candidates, max_width_delta=6, max_height_delta=4, max_score=0.60, text_masks=None):
     candidates = tuple(candidates)
     best_name, best_score, second_score = _rank_text_candidates(
-        gray, candidates, max_width_delta, max_height_delta
+        gray, candidates, max_width_delta, max_height_delta, text_masks
     )
 
     if (
@@ -543,6 +556,54 @@ def _match_known_text(gray, candidates, max_width_delta=6, max_height_delta=4, m
     ):
         return best_name
     return None
+
+
+def has_teach_button(arr):
+    """Returns True/False when the Teach control is recognized, else None."""
+    x0, y0, x1, y1 = TEACH_BUTTON_REGION
+    ix0, iy0, ix1, iy1 = TEACH_ICON_REGION
+    if arr.shape[1] < max(x1, ix1) or arr.shape[0] < max(y1, iy1):
+        return False
+
+    icon = arr[iy0:iy1, ix0:ix1].astype(np.int16)
+    red, green, blue = icon[:, :, 0], icon[:, :, 1], icon[:, :, 2]
+    if np.count_nonzero((blue > 120) & (blue - red > 40) & (blue - green > 20)) >= 250:
+        return True
+
+    # The lower half contains the label; excluding the icon keeps OCR focused
+    # on the word rather than button artwork.
+    button_crop = arr[y0:y1, x0:x1]
+    label_crop = button_crop[button_crop.shape[0] // 2:, :]
+    ocr_crop = normalize_text_crop(label_crop, 96, 48)
+    return _ocr_teach_label(cv2.cvtColor(ocr_crop, cv2.COLOR_RGB2GRAY))
+
+
+def _ocr_teach_label(gray):
+    tesseract = shutil.which("tesseract")
+    if not tesseract:
+        return None
+
+    enlarged = cv2.resize(gray, None, fx=4, fy=4, interpolation=cv2.INTER_CUBIC)
+    _, thresholded = cv2.threshold(enlarged, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+    ok, encoded = cv2.imencode(".png", thresholded)
+    if not ok:
+        return None
+
+    try:
+        result = subprocess.run(
+            [tesseract, "stdin", "stdout", "--psm", "7"],
+            input=encoded.tobytes(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=2,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+    return "".join(ch for ch in result.stdout.decode(errors="ignore") if ch.isalpha()).lower() == "teach"
+
+
 def _sanitize_parts_name(text):
     if not text:
         return None
@@ -1003,19 +1064,19 @@ def _ocr_parts_name_from_crop(name_crop):
 
 def _read_parts_name_from_crop(name_crop):
     gray = cv2.cvtColor(name_crop, cv2.COLOR_RGB2GRAY)
-    best_name, best_score, second_score = _rank_text_candidates(gray, ALL_KNOWN_PART_NAMES, 6, 4)
+    text_masks = _generate_text_masks(gray)
+    best_name, best_score, second_score = _rank_text_candidates(gray, ALL_KNOWN_PART_NAMES, 6, 4, text_masks)
     best_9mm_name, best_9mm_score, second_9mm_score = _rank_text_candidates(
         gray,
         ("t0.15*9.0", "t0.15*9", "t0.2*9.0", "t0.2*9"),
-        8,
-        5,
+        8, 5, text_masks,
     )
     matched_9mm_name = _match_known_text(
         gray,
         ("t0.15*9.0", "t0.15*9", "t0.2*9.0", "t0.2*9"),
         max_width_delta=18,
         max_height_delta=10,
-        max_score=0.95,
+        max_score=0.95, text_masks=text_masks,
     )
     if matched_9mm_name is not None:
         normalized = normalize_circle_parts_name(matched_9mm_name)
@@ -1102,7 +1163,7 @@ def _probe_active_row_parts_name(arr, active_row, row_y_start, row_height, row_s
     return best_name, best_score, best_offset
 
 
-def ocr_part_number(arr, active_row):
+def ocr_part_number(arr, active_row, preferred_offset=None):
     """Recognizes the part number for the active visible row from the No. column."""
     try:
         if active_row < 0:
@@ -1117,15 +1178,16 @@ def ocr_part_number(arr, active_row):
         parts_name_slice = table_layout["parts_name_slice"]
         parts_name_width = table_layout["parts_name_width"]
 
-        _, _, preferred_offset = _probe_active_row_parts_name(
-            arr,
-            active_row,
-            row_y_start,
-            row_height,
-            row_stride,
-            parts_name_slice,
-            parts_name_width,
-        )
+        if preferred_offset is None:
+            _, _, preferred_offset = _probe_active_row_parts_name(
+                arr,
+                active_row,
+                row_y_start,
+                row_height,
+                row_stride,
+                parts_name_slice,
+                parts_name_width,
+            )
 
         active_y_start = row_y_start + active_row * row_stride
         active_y_end = active_y_start + row_height
@@ -1223,7 +1285,7 @@ def ocr_parts_name(arr, active_row):
         print(f"Parts name OCR failed: {e}")
     return None
 
-def detect_active_feeder_auto_tc(arr, active_row):
+def detect_active_feeder_auto_tc(arr, active_row, preferred_offset=None):
     """Tri-state detector for the "Auto TC" feeder label on the active row.
 
     Returns True when the label is confidently "Auto TC", False only when a
@@ -1261,13 +1323,11 @@ def detect_active_feeder_auto_tc(arr, active_row):
             if matched_label is not None:
                 return matched_label == "Auto TC"
 
-        feeder_template_path = os.path.join(TEMPLATE_DIR, FEEDER_AUTO_TC_TEMPLATE)
-        if not os.path.exists(feeder_template_path):
-            return None
-
         feeder_mask = np.zeros_like(feeder_gray, dtype=np.uint8)
         feeder_mask[feeder_gray > 220] = 255
-        feeder_template = np.array(Image.open(feeder_template_path).convert("L"))
+        feeder_template = _load_template_mask(FEEDER_AUTO_TC_TEMPLATE)
+        if feeder_template is None:
+            return None
         if feeder_mask.shape != feeder_template.shape:
             return None
 
@@ -1295,15 +1355,16 @@ def detect_active_feeder_auto_tc(arr, active_row):
 
         return None
 
-    _, _, preferred_offset = _probe_active_row_parts_name(
-        arr,
-        active_row,
-        row_y_start,
-        row_height,
-        row_stride,
-        parts_name_slice,
-        parts_name_width,
-    )
+    if preferred_offset is None:
+        _, _, preferred_offset = _probe_active_row_parts_name(
+            arr,
+            active_row,
+            row_y_start,
+            row_height,
+            row_stride,
+            parts_name_slice,
+            parts_name_width,
+        )
     y_offsets = list(_iter_active_row_y_offsets(arr))
     if preferred_offset in y_offsets:
         y_offsets.remove(preferred_offset)
@@ -1766,6 +1827,11 @@ def run_inference(image_b64, shape_type=None):
                 "right": None,
             }
 
+        def make_idle_result():
+            result = make_no_detect_result()
+            result["screen_state"] = "idle"
+            return result
+
         def build_session_id(session_suffix_override=None, prefer_cylinder=False):
             if prefer_cylinder and active_parts_name in KNOWN_CYLINDER_PART_NAME_SUFFIXES:
                 session_suffix = active_parts_name
@@ -1781,7 +1847,7 @@ def run_inference(image_b64, shape_type=None):
                     session_suffix = resolved_profile[0]
             if session_suffix in {"t0.2*9.0", "t0.2*9"}:
                 session_suffix = "t0.15*9.0"
-            part_num = ocr_part_number(table_arr, active_row)
+            part_num = ocr_part_number(table_arr, active_row, preferred_parts_name_offset)
             if part_num:
                 return f"session_{part_num}_{session_suffix}"
             return f"session_{active_row + 1}_{session_suffix}" if active_row != -1 else None
@@ -1835,6 +1901,9 @@ def run_inference(image_b64, shape_type=None):
         if img.shape[1] != 1024 or img.shape[0] != 768:
             return {"error": f"Unsupported image resolution: {(img.shape[1], img.shape[0])}. Expected 1024x768."}
         original_arr = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        if has_teach_button(original_arr) is False:
+            return make_idle_result()
+
         table_arr = original_arr
         frame_scale_x = get_frame_scale_x(original_arr)
         frame_scale_y = get_frame_scale_y(original_arr)
@@ -1888,6 +1957,7 @@ def run_inference(image_b64, shape_type=None):
         template_kind = None
         active_feeder_auto_tc = None
         active_parts_name = None
+        preferred_parts_name_offset = None
         best_template = None
 
         # Prefer the visible "*" marker in the No. column when present;
@@ -1972,11 +2042,9 @@ def run_inference(image_b64, shape_type=None):
                     if filename is None:
                         template_arr = _render_parts_name_mask(part_name, (mask_active.shape[1], mask_active.shape[0]), 0, 0)
                     else:
-                        template_path = os.path.join(TEMPLATE_DIR, filename)
-                        if not os.path.exists(template_path):
+                        template_arr = _load_template_mask(filename)
+                        if template_arr is None:
                             continue
-                        template_img = Image.open(template_path).convert("L")
-                        template_arr = np.array(template_img)
 
                     if mask_active.shape == template_arr.shape:
                         diff, match_score = score_parts_name_template_match(mask_active, template_arr)
@@ -1998,11 +2066,9 @@ def run_inference(image_b64, shape_type=None):
                         if filename is None:
                             template_arr = _render_parts_name_mask(part_name, (mask_active.shape[1], mask_active.shape[0]), 0, 0)
                         else:
-                            template_path = os.path.join(TEMPLATE_DIR, filename)
-                            if not os.path.exists(template_path):
+                            template_arr = _load_template_mask(filename)
+                            if template_arr is None:
                                 continue
-                            template_img = Image.open(template_path).convert("L")
-                            template_arr = np.array(template_img)
                         if mask_active.shape != template_arr.shape:
                             continue
                         diff, match_score = score_parts_name_template_match(mask_active, template_arr)
@@ -2010,23 +2076,24 @@ def run_inference(image_b64, shape_type=None):
                             weak_small_template = (part_name, ranges, r_nom, kind)
                             break
 
+                text_masks = _generate_text_masks(crop_gray)
                 best_9mm_name, best_9mm_score, second_9mm_score = _rank_text_candidates(
                     crop_gray,
                     ("t0.15*9.0", "t0.15*9", "t0.2*9.0", "t0.2*9"),
                     8,
-                    5,
+                    5, text_masks,
                 )
                 best_2mm_name, best_2mm_score, second_2mm_score = _rank_text_candidates(
                     crop_gray,
                     ("t0.3*2.0",),
                     8,
-                    5,
+                    5, text_masks,
                 )
                 best_10mm_name, best_10mm_score, second_10mm_score = _rank_text_candidates(
                     crop_gray,
                     ("t0.15*10", "t0.15*10.0", "t0.2*10", "t0.2*10.0"),
                     8,
-                    5,
+                    5, text_masks,
                 )
                 fallback_profile = resolve_circle_profile_fallback(
                     best_template,
@@ -2037,15 +2104,21 @@ def run_inference(image_b64, shape_type=None):
                     best_9mm_score,
                     second_9mm_score,
                 )
-                active_parts_name = ocr_parts_name(table_arr, active_row)
+                active_parts_name, _, preferred_parts_name_offset = _probe_active_row_parts_name(
+                    table_arr,
+                    active_row,
+                    row_y_start,
+                    row_height,
+                    row_stride,
+                    parts_name_slice,
+                    parts_name_width,
+                )
                 parts_name_profile = resolve_circle_profile_with_template_override(active_parts_name, best_template)
                 if (
-                    parts_name_profile is None and
                     best_template is not None and
                     best_template[4] == "large" and
-                    best_template[7] <= 85.0 and
-                    camera_crop_mean_hint < 190.0 and
-                    camera_crop_std_hint >= 35.0
+                    best_template[7] <= 21.0 and
+                    (parts_name_profile is None or parts_name_profile[3] == "medium")
                 ):
                     template_match, template_ranges, template_nominal, template_kind = (
                         best_template[0],
@@ -2111,7 +2184,9 @@ def run_inference(image_b64, shape_type=None):
                 elif best_match:
                     template_match, template_ranges, template_nominal, template_kind, _, _ = best_match
 
-            active_feeder_auto_tc = detect_active_feeder_auto_tc(table_arr, active_row)
+            active_feeder_auto_tc = detect_active_feeder_auto_tc(
+                table_arr, active_row, preferred_parts_name_offset
+            )
             if active_parts_name in KNOWN_CYLINDER_PART_NAME_SUFFIXES:
                 active_feeder_auto_tc = False
 
@@ -2379,7 +2454,11 @@ def run_inference(image_b64, shape_type=None):
                         pair_overlap <= 10.0 and
                         center_separation >= 0.6 * max(left_r, right_r) and
                         not (right_near_cross and left_far_from_cross) and
-                        not (pair_sits_low and active_feeder_auto_tc is not False)
+                        not (
+                            pair_sits_low and
+                            active_feeder_auto_tc is not False and
+                            active_parts_name not in KNOWN_CYLINDER_PART_NAME_SUFFIXES
+                        )
                     ):
                         left_candidate = left_option
                         right_candidate = right_option
@@ -2669,7 +2748,7 @@ def run_inference(image_b64, shape_type=None):
 
                 refined_width = rect_right - rect_left
                 refined_height = rect_bottom - rect_top
-                if refined_height > refined_width * 0.62:
+                if refined_height > refined_width * 0.65:
                     return make_no_detect_result()
                 if (
                     refined_width < raw_box_width - 8 or

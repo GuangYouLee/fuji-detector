@@ -215,6 +215,10 @@ def _format_option_b_response(result, session_id, active_labels, execute_status)
     return formatted
 
 
+def _no_detection_status(result):
+    return "idle" if isinstance(result, dict) and result.get("screen_state") == "idle" else "none"
+
+
 
 def _run_detect_screen_with_session(data):
     result, error = _run_detection(data, tolerate_unsupported_resolution=True)
@@ -226,7 +230,7 @@ def _run_detect_screen_with_session(data):
         _cache_delete(detected_session_id)
 
     detected = [label for label in POINT_FIELDS if result.get(label) is not None]
-    execute_status = "none" if not detected else "pass"
+    execute_status = _no_detection_status(result) if not detected else "pass"
 
     return _success(
         _format_option_b_response(
@@ -282,7 +286,7 @@ def _run_detect_screen_1by1(data):
 
     started = _start_cached_session(result)
     if not started:
-        return _format_detect_screen_response(None, None, result, "none")
+        return _format_detect_screen_response(None, None, result, _no_detection_status(result))
 
     detector_session_id, popped_label, remaining_labels = started
     execute_status = "continue" if remaining_labels else "pass"
@@ -394,7 +398,7 @@ def detect_screen_next():
     started = _start_cached_session(result)
     if not started:
         return _success({
-            "execute_label": "none",
+            "execute_label": _no_detection_status(result),
             "message": "x=null,y=null",
             "session_id": None,
             "edges_remaining": 0,
