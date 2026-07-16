@@ -1,4 +1,5 @@
 import base64
+import binascii
 import random
 import shutil
 import subprocess
@@ -576,6 +577,22 @@ def has_teach_button(arr):
     label_crop = button_crop[button_crop.shape[0] // 2:, :]
     ocr_crop = normalize_text_crop(label_crop, 96, 48)
     return _ocr_teach_label(cv2.cvtColor(ocr_crop, cv2.COLOR_RGB2GRAY))
+
+
+def check_teach_button(image_b64):
+    """Check whether a base64 screenshot contains the Teach control."""
+    try:
+        if "base64," in image_b64:
+            image_b64 = image_b64.split("base64,", 1)[1]
+        image_data = base64.b64decode(image_b64)
+        image = cv2.imdecode(np.frombuffer(image_data, dtype=np.uint8), cv2.IMREAD_COLOR)
+    except (binascii.Error, ValueError, TypeError):
+        return False
+
+    if image is None or image.shape[1] != 1024 or image.shape[0] != 768:
+        return False
+
+    return has_teach_button(cv2.cvtColor(image, cv2.COLOR_BGR2RGB)) is True
 
 
 def _ocr_teach_label(gray):

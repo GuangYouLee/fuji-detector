@@ -4,6 +4,7 @@ import uuid
 import redis
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+from FUJI_DETECTOR.inspect import check_teach_button as _check_teach_button
 from FUJI_DETECTOR.inspect import run_inference as _run_fuji_inference
 
 
@@ -321,6 +322,22 @@ def process_image():
     if error:
         return _error(error[0], status=error[1])
     return _success(result)
+
+
+@app.route("/api/v1/check_teach_button", methods=["POST"])
+def check_teach_button():
+    data = _request_data()
+    image_b64 = data.get("img_base64")
+    if not image_b64:
+        return jsonify({
+            "success": False,
+            "data": {"message": "Missing required field: img_base64."},
+        }), 400
+
+    return jsonify({
+        "success": True,
+        "data": {"execute_label": "found" if _check_teach_button(image_b64) else "idle"},
+    })
 
 
 @app.route("/api/v1/detect_screen", methods=["POST"])
