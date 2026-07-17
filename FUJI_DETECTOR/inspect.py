@@ -1945,6 +1945,8 @@ def run_inference(image_b64, shape_type=None):
                 session_suffix = active_parts_name
             elif prefer_cylinder and active_feeder_auto_tc is False:
                 session_suffix = "KG3B_35_5F4Z"
+            elif active_feeder_auto_tc is True and active_parts_name and "*" not in active_parts_name:
+                session_suffix = "big_rectangle"
             else:
                 session_suffix = session_suffix_override or template_match or active_parts_name
             if not session_suffix:

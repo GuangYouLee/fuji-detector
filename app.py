@@ -18,6 +18,7 @@ POINT_FIELDS = ("top", "bottom", "left", "right")
 BIG_CIRCLE_DETECTIONS = 4
 BIG_CIRCLE_EDGE_ORDER = ("bottom", "left", "top", "right")
 NEXT_EDGE_CACHE_PREFIX = "next_edge:"
+NEXT_EDGE_CALLS_CACHE_PREFIX = "next_edge_calls:"
 CIRCLE_CLICK_BOUNDS = (35, 290, 330, 561)
 
 # ---------------------------------------------------------------------------
@@ -227,6 +228,8 @@ def _no_detection_status(result):
 
 
 def _pattern_label(session_id):
+    if session_id.endswith("_big_rectangle"):
+        return "big_rectangle"
     if any(session_id.endswith(f"_{suffix}") for suffix in KNOWN_CYLINDER_PART_NAME_SUFFIXES):
         return "cylinder"
     return "big_circle" if session_id.endswith("_t0.2*11.0") else "normal_circle"
@@ -265,6 +268,13 @@ def _cache_big_circle_next_edges(session_id, result, detected_label):
 def _clickable_circle_point(point):
     left, top, right, bottom = CIRCLE_CLICK_BOUNDS
     return [min(max(point[0], left), right), min(max(point[1], top), bottom)]
+
+
+def _next_edge_call_limit_reached(session_id):
+    cache_key = f"{NEXT_EDGE_CALLS_CACHE_PREFIX}{session_id}"
+    count = (_cache_get(cache_key) or {}).get("count", 0) + 1
+    _cache_set(cache_key, {"count": count})
+    return count >= 3
 
 
 def _run_detect_screen_with_session(data):
@@ -456,6 +466,9 @@ def next_edge():
     except (IndexError, TypeError, ValueError):
         _cache_delete(cache_key)
         return _detect_screen_error(f"No predicted edge found for session '{session_id}'.", status=404)
+
+    if _next_edge_call_limit_reached(session_id):
+        return jsonify({"success": True, "data": {"execute_label": "exceed_3"}})
 
     if [x, y] == next_prediction["point"]:
         edges.pop(0)

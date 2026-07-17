@@ -139,7 +139,7 @@ Stateless pattern classification. It runs inference once and does not create or 
   }
 }
 ```
-`execute_label` is `normal_circle`, `big_circle`, or `cylinder`.
+`execute_label` is `normal_circle`, `big_circle`, `big_rectangle`, or `cylinder`. An `Auto TC` feeder whose detected Parts Name does not contain `*` is `big_rectangle`.
 
 For `big_circle`, call `/api/v1/detect_screen` with each new image. It returns the session ID used for the four-call progress sequence; Redis returns `continue` for the first three calls, then `pass` on the fourth.
 
@@ -165,7 +165,7 @@ Checks whether the Parts Name cell in the row after the highlighted row is empty
 `false` means the next Parts Name cell is empty; otherwise the endpoint returns `true`.
 
 ### POST `/api/v1/next_edge`
-Returns the next fitted coordinate for a `big_circle` session. Off-screen predictions are clamped 20 px inside the clickable camera rectangle (`35,290` to `330,561`) and remain available until the next `detect_screen` call. It uses a separate Redis key and does not change the `detect_screen` `continue`/`pass` counter.
+Returns the next fitted coordinate for a `big_circle` session. Off-screen predictions are clamped 20 px inside the clickable camera rectangle (`35,290` to `330,561`) and remain available until the next `detect_screen` call. It uses a separate Redis key and does not change the `detect_screen` `continue`/`pass` counter. The third call for the same session returns `execute_label: "exceed_3"`.
 
 **Request Payload**
 ```json
