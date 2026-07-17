@@ -5,6 +5,8 @@ import redis
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from FUJI_DETECTOR.inspect import check_teach_button as _check_teach_button
+from FUJI_DETECTOR.inspect import is_next_parts_row_empty as _is_next_parts_row_empty
+from FUJI_DETECTOR.inspect import KNOWN_CYLINDER_PART_NAME_SUFFIXES
 from FUJI_DETECTOR.inspect import run_inference as _run_fuji_inference
 
 
@@ -13,6 +15,10 @@ app.json.sort_keys = False
 CORS(app)
 
 POINT_FIELDS = ("top", "bottom", "left", "right")
+BIG_CIRCLE_DETECTIONS = 4
+BIG_CIRCLE_EDGE_ORDER = ("bottom", "left", "top", "right")
+NEXT_EDGE_CACHE_PREFIX = "next_edge:"
+CIRCLE_CLICK_BOUNDS = (35, 290, 330, 561)
 
 # ---------------------------------------------------------------------------
 # Sequential session cache — used by /detect_screen/next
@@ -161,7 +167,7 @@ def _format_detector_response(result, requested_edge=None):
 
 def _resume_cached_session(session_id):
     slot = _cache_get(session_id)
-    if not slot:
+    if not slot or "edges" not in slot or "result" not in slot:
         return None
 
     remaining_labels = slot["edges"]
@@ -220,6 +226,46 @@ def _no_detection_status(result):
     return "idle" if isinstance(result, dict) and result.get("screen_state") == "idle" else "none"
 
 
+def _pattern_label(session_id):
+    if any(session_id.endswith(f"_{suffix}") for suffix in KNOWN_CYLINDER_PART_NAME_SUFFIXES):
+        return "cylinder"
+    return "big_circle" if session_id.endswith("_t0.2*11.0") else "normal_circle"
+
+
+def _advance_big_circle_session(session_id):
+    slot = _cache_get(session_id) or {}
+    detection_count = slot.get("big_circle_detections", 0) + 1
+    if detection_count < BIG_CIRCLE_DETECTIONS:
+        _cache_set(session_id, {"big_circle_detections": detection_count})
+        return "continue"
+    _cache_delete(session_id)
+    return "pass"
+
+
+def _cache_big_circle_next_edges(session_id, result, detected_label):
+    predicted_edges = result.get("predicted_edges")
+    cache_key = f"{NEXT_EDGE_CACHE_PREFIX}{session_id}"
+    if (
+        not isinstance(predicted_edges, dict)
+        or any(edge not in predicted_edges for edge in BIG_CIRCLE_EDGE_ORDER)
+        or detected_label not in BIG_CIRCLE_EDGE_ORDER
+    ):
+        return
+
+    current_index = BIG_CIRCLE_EDGE_ORDER.index(detected_label)
+    remaining_edges = BIG_CIRCLE_EDGE_ORDER[current_index + 1:] + BIG_CIRCLE_EDGE_ORDER[:current_index]
+    _cache_set(cache_key, {
+        "edges": [
+            {"edge": edge, "point": predicted_edges[edge]}
+            for edge in remaining_edges
+        ],
+    })
+
+
+def _clickable_circle_point(point):
+    left, top, right, bottom = CIRCLE_CLICK_BOUNDS
+    return [min(max(point[0], left), right), min(max(point[1], top), bottom)]
+
 
 def _run_detect_screen_with_session(data):
     result, error = _run_detection(data, tolerate_unsupported_resolution=True)
@@ -266,7 +312,7 @@ def _detect_screen_error(message, status=400):
 
 def _run_detect_screen_1by1(data):
     session_id = (data.get("session_id") or "").strip()
-    if session_id:
+    if session_id and not (_pattern_label(session_id) == "big_circle" and data.get("img_base64")):
         resumed = _resume_cached_session(session_id)
         if not resumed:
             return _detect_screen_error(f"Session '{session_id}' not found or expired.")
@@ -279,6 +325,16 @@ def _run_detect_screen_1by1(data):
         return _detect_screen_error(error[0], status=error[1])
 
     detected_session_id = result.get("session_id")
+    if detected_session_id and _pattern_label(detected_session_id) == "big_circle":
+        detected_label = next((label for label in POINT_FIELDS if result.get(label) is not None), None)
+        _cache_big_circle_next_edges(detected_session_id, result, detected_label)
+        return _format_detect_screen_response(
+            detected_session_id,
+            detected_label,
+            result,
+            _advance_big_circle_session(detected_session_id),
+        )
+
     if detected_session_id:
         resumed = _resume_cached_session(detected_session_id)
         if resumed:
@@ -340,9 +396,84 @@ def check_teach_button():
     })
 
 
+@app.route("/api/v1/check_next", methods=["POST"])
+def check_next():
+    image_b64 = _request_data().get("img_base64")
+    if not image_b64:
+        return jsonify({
+            "success": False,
+            "data": {"message": "Missing required field: img_base64."},
+        }), 400
+
+    try:
+        is_empty = _is_next_parts_row_empty(image_b64)
+    except ValueError as error:
+        return jsonify({"success": False, "data": {"message": str(error)}}), 400
+
+    return jsonify({"success": True, "data": {"execute_label": str(not is_empty).lower()}})
+
+
+@app.route("/api/v1/detect_pattern", methods=["POST"])
+def detect_pattern():
+    result, error = _run_detection(_request_data(default_training_type="FUJI_DETECTOR"))
+    if error:
+        return jsonify({"success": False, "data": {"message": error[0]}}), error[1]
+
+    session_id = result.get("session_id")
+    if not session_id:
+        return jsonify({"success": False, "data": {"message": "No detectable pattern found."}}), 422
+
+    return jsonify({
+        "success": True,
+        "data": {"execute_label": _pattern_label(session_id)},
+    })
+
+
 @app.route("/api/v1/detect_screen", methods=["POST"])
 def detect_screen():
     return _run_detect_screen_1by1(_request_data())
+
+
+@app.route("/api/v1/next_edge", methods=["POST"])
+def next_edge():
+    session_id = (_request_data().get("session_id") or "").strip()
+    if _pattern_label(session_id) != "big_circle":
+        return _detect_screen_error("Missing or unsupported big_circle session_id.")
+
+    cache_key = f"{NEXT_EDGE_CACHE_PREFIX}{session_id}"
+    slot = _cache_get(cache_key)
+    edges = slot.get("edges") if isinstance(slot, dict) else None
+    if not isinstance(edges, list) or not edges:
+        return _detect_screen_error(f"No predicted edge found for session '{session_id}'.", status=404)
+
+    next_prediction = edges[0]
+    if not isinstance(next_prediction, dict) or not isinstance(next_prediction.get("point"), (list, tuple)):
+        _cache_delete(cache_key)
+        return _detect_screen_error(f"No predicted edge found for session '{session_id}'.", status=404)
+
+    try:
+        x, y = _clickable_circle_point(next_prediction["point"])
+    except (IndexError, TypeError, ValueError):
+        _cache_delete(cache_key)
+        return _detect_screen_error(f"No predicted edge found for session '{session_id}'.", status=404)
+
+    if [x, y] == next_prediction["point"]:
+        edges.pop(0)
+        if edges:
+            _cache_set(cache_key, slot)
+        else:
+            _cache_delete(cache_key)
+
+    return jsonify({
+        "success": True,
+        "data": {
+            "execute_label": "next_edge",
+            "message": f"x={x},y={y}",
+            "edge": str(next_prediction.get("edge", "")).capitalize() or None,
+        },
+    })
+
+
 @app.route("/api/v1/<any(top, bottom, left, right):edge>", methods=["POST"])
 @app.route("/api/v1/detect_screen/<any(top, bottom, left, right):edge>", methods=["POST"])
 def process_image_edge(edge):
@@ -448,6 +579,7 @@ def clear_session():
         return _error("Missing required parameter: 'session_id'")
 
     _cache_delete(session_id)
+    _cache_delete(f"{NEXT_EDGE_CACHE_PREFIX}{session_id}")
     return _success({"message": f"Session '{session_id}' cleared"})
 
 

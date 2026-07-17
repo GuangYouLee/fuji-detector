@@ -117,6 +117,91 @@ def get_table_layout(arr):
     }
 
 
+def find_active_table_row(arr):
+    table_layout = get_table_layout(arr)
+    row_y_start = table_layout["row_y_start"]
+    row_height = table_layout["row_height"]
+    row_stride = table_layout["row_stride"]
+    no_col_slice = table_layout["no_col_slice"]
+    no_col_width = table_layout["no_col_width"]
+    row_probe_left = min(arr.shape[1], scale_frame_x(arr, 360))
+    row_probe_right = min(arr.shape[1], scale_frame_x(arr, 620))
+    row_averages = []
+    row_midtone_scores = []
+    row_selection_deltas = []
+    marker_rows = []
+
+    for idx in range(TABLE_VISIBLE_ROWS):
+        y_start_row = row_y_start + idx * row_stride
+        y_end_row = y_start_row + row_height
+        if y_end_row > arr.shape[0]:
+            row_averages.append(255.0)
+            row_midtone_scores.append(0.0)
+            row_selection_deltas.append(float("inf"))
+            marker_rows.append(False)
+            continue
+
+        row_slice = arr[y_start_row:y_end_row, row_probe_left:row_probe_right]
+        row_gray = np.mean(row_slice, axis=2)
+        row_median = float(np.median(row_gray))
+        row_averages.append(float(np.mean(row_gray)))
+        row_midtone_scores.append(float(np.mean((row_gray >= 165.0) & (row_gray <= 225.0))))
+        row_selection_deltas.append(abs(row_median - 194.0))
+        marker_crop = normalize_text_crop(
+            arr[y_start_row:y_end_row, no_col_slice],
+            no_col_width,
+            29,
+        )
+        marker_rows.append(_has_selected_row_marker(marker_crop))
+
+    if marker_rows.count(True) == 1:
+        return marker_rows.index(True)
+    if not row_averages:
+        return -1
+
+    best_idx = min(
+        range(len(row_selection_deltas)),
+        key=lambda idx: (row_selection_deltas[idx], -row_midtone_scores[idx], row_averages[idx]),
+    )
+    if row_selection_deltas[best_idx] <= 28.0 and row_midtone_scores[best_idx] >= 0.04:
+        return best_idx
+
+    min_idx = int(np.argmin(row_averages))
+    return min_idx if row_averages[min_idx] < 210 else -1
+
+
+def is_next_parts_row_empty(image_b64):
+    if not isinstance(image_b64, str) or not image_b64:
+        raise ValueError("Missing required field: img_base64.")
+    if "base64," in image_b64:
+        image_b64 = image_b64.split("base64,", 1)[1]
+
+    try:
+        img_data = base64.b64decode(image_b64)
+    except (ValueError, binascii.Error) as error:
+        raise ValueError("Failed to decode image data.") from error
+
+    img = cv2.imdecode(np.frombuffer(img_data, dtype=np.uint8), cv2.IMREAD_COLOR)
+    if img is None:
+        raise ValueError("Failed to decode image data.")
+    if img.shape[1] != 1024 or img.shape[0] != 768:
+        raise ValueError(f"Unsupported image resolution: {(img.shape[1], img.shape[0])}. Expected 1024x768.")
+
+    arr = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    active_row = find_active_table_row(arr)
+    next_row = active_row + 1
+    if active_row == -1 or next_row >= TABLE_VISIBLE_ROWS:
+        return False
+
+    table_layout = get_table_layout(arr)
+    margin = scale_frame_len(arr, 3)
+    y_start = table_layout["row_y_start"] + next_row * table_layout["row_stride"] + margin
+    y_end = y_start + table_layout["row_height"] - (2 * margin)
+    parts_name_slice = table_layout["parts_name_slice"]
+    crop = arr[y_start:y_end, parts_name_slice.start + margin:parts_name_slice.stop - margin]
+    return not np.any(np.mean(crop, axis=2) < 128)
+
+
 def normalize_text_crop(crop, target_width, target_height):
     if crop.size == 0:
         return crop
@@ -238,6 +323,12 @@ def scale_detector_result_to_original_frame(result, scale_x, scale_y):
     for key in ("top", "bottom", "left", "right", "center"):
         if key in scaled:
             scaled[key] = scale_point(scaled[key])
+
+    if "predicted_edges" in scaled:
+        scaled["predicted_edges"] = {
+            key: scale_point(point)
+            for key, point in scaled["predicted_edges"].items()
+        }
 
     if "radius" in scaled and scaled["radius"] is not None:
         scaled["radius"] = float(scaled["radius"]) * ((scale_x + scale_y) / 2.0)
@@ -1977,62 +2068,13 @@ def run_inference(image_b64, shape_type=None):
         preferred_parts_name_offset = None
         best_template = None
 
-        # Prefer the visible "*" marker in the No. column when present;
-        # otherwise fall back to the gray selection background heuristic.
         table_layout = get_table_layout(table_arr)
         row_y_start = table_layout["row_y_start"]
         row_height = table_layout["row_height"]
         row_stride = table_layout["row_stride"]
         parts_name_slice = table_layout["parts_name_slice"]
         parts_name_width = table_layout["parts_name_width"]
-        no_col_slice = table_layout["no_col_slice"]
-        no_col_width = table_layout["no_col_width"]
-        row_probe_left = min(table_arr.shape[1], scale_frame_x(table_arr, 360))
-        row_probe_right = min(table_arr.shape[1], scale_frame_x(table_arr, 620))
-        row_averages = []
-        row_midtone_scores = []
-        row_medians = []
-        row_selection_deltas = []
-        marker_rows = []
-        for idx in range(TABLE_VISIBLE_ROWS):
-            y_start_row = row_y_start + idx * row_stride
-            y_end_row = y_start_row + row_height
-            if y_end_row <= table_arr.shape[0]:
-                row_slice = table_arr[y_start_row:y_end_row, row_probe_left:row_probe_right]
-                row_gray = np.mean(row_slice, axis=2)
-                row_mean = float(np.mean(row_gray))
-                row_median = float(np.median(row_gray))
-                row_averages.append(row_mean)
-                row_medians.append(row_median)
-                row_midtone_scores.append(float(np.mean((row_gray >= 165.0) & (row_gray <= 225.0))))
-                row_selection_deltas.append(abs(row_median - 194.0))
-                marker_crop = normalize_text_crop(
-                    table_arr[y_start_row:y_end_row, no_col_slice],
-                    no_col_width,
-                    29,
-                )
-                marker_rows.append(_has_selected_row_marker(marker_crop))
-            else:
-                row_averages.append(255.0)
-                row_medians.append(255.0)
-                row_midtone_scores.append(0.0)
-                row_selection_deltas.append(float("inf"))
-                marker_rows.append(False)
-
-        active_row = -1
-        if marker_rows.count(True) == 1:
-            active_row = marker_rows.index(True)
-        elif row_averages:
-            best_idx = min(
-                range(len(row_selection_deltas)),
-                key=lambda idx: (row_selection_deltas[idx], -row_midtone_scores[idx], row_averages[idx]),
-            )
-            if row_selection_deltas[best_idx] <= 28.0 and row_midtone_scores[best_idx] >= 0.04:
-                active_row = best_idx
-            else:
-                min_idx = int(np.argmin(row_averages))
-                if row_averages[min_idx] < 210:
-                    active_row = min_idx
+        active_row = find_active_table_row(table_arr)
         if active_row != -1:
             y_start_row = row_y_start + active_row * row_stride
             y_end_row = y_start_row + row_height
@@ -5422,6 +5464,8 @@ def run_inference(image_b64, shape_type=None):
                 "right": visible_pixels["right"],
                 "session_id": session_id,
             }
+            if R > 120 or template_kind == "large":
+                res["predicted_edges"] = raw_pixels
             return finalize_result(res)
 
         # 3. Mode Routing Control Flow
